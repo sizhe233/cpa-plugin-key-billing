@@ -789,6 +789,20 @@ func TestAuthQuotaReset(t *testing.T) {
 			}
 			var response ManagementResponse
 			decodeResult(t, raw, &response)
+			if tc.name != "admin" {
+				// sizhe233 hardening: the API-key resource route is blocked before any
+				// host call; the handler logic itself is exercised directly below.
+				if response.StatusCode != http.StatusNotFound || reads != 0 || consumes != 0 {
+					t.Fatalf("blocked API-key reset: status = %d reads = %d resets = %d", response.StatusCode, reads, consumes)
+				}
+				if access.APIKey || tc.name == "unknown key" {
+					if tc.name == "unknown key" {
+						response = apiKeyUnauthorized()
+					} else {
+						response = app.authQuotaReset(req, access)
+					}
+				}
+			}
 			if response.StatusCode != tc.want {
 				t.Fatalf("status = %d, want %d: %s", response.StatusCode, tc.want, response.Body)
 			}

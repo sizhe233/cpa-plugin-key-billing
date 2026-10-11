@@ -80,7 +80,10 @@ func (a *App) routeResource(req ManagementRequest, suffix string) ManagementResp
 			break
 		}
 	}
-	if handler == nil {
+	// sizhe233 hardening: API-key holders never reach auth files. These routes
+	// read full credential JSON (host.auth.get) and call upstream quota/reset
+	// endpoints with operator credentials; keep them Management-API only.
+	if handler == nil || apiKeyBlockedResource(suffix) {
 		return apiKeyJSONError(http.StatusNotFound, "not_found", "Resource route not found: "+req.Method+" "+req.Path)
 	}
 	access, ok := a.apiKeyViewAccess(req)
@@ -376,4 +379,13 @@ func (a *App) eventKeys(req ManagementRequest) ManagementResponse {
 		return errorResponse(err)
 	}
 	return JSONResponse(http.StatusOK, keys)
+}
+
+func apiKeyBlockedResource(suffix string) bool {
+	switch suffix {
+	case routeAuthFiles, routeAuthQuota, routeAuthQuotaReset:
+		return true
+	default:
+		return false
+	}
 }

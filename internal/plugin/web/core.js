@@ -28,7 +28,8 @@ function readPanelKey() {
 const embedded = window.parent !== window;
 document.body.classList.toggle("embedded", embedded);
 const ADMIN_TAB_IDS = ["keys", "analysis", "request-events", "errors", "auth-files", "settings"];
-const ACCOUNT_TAB_IDS = ["subscription", "analysis", "request-events", "errors", "auth-files"];
+// sizhe233 hardening: API-key holders have no auth-files tab (routes return 404).
+const ACCOUNT_TAB_IDS = ["subscription", "analysis", "request-events", "errors"];
 const PAGE_ROUTE_KEY = "cpa-key-billing.route.v1." + (embedded ? "embedded" : "standalone");
 
 function parsePageRoute(value) {
