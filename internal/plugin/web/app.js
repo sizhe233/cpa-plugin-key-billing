@@ -28,7 +28,7 @@ async function setLoginMode(mode, preserveError) {
 function showGate(mode, error) {
   sessionGeneration++;
   hideNotice();
-  hideCostTooltip();
+  closeHoverTooltip();
   try { sessionStorage.removeItem(SESSION_CREDENTIAL_PREFIX + mode); } catch (_) {}
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   for (const controller of activeRequests) controller.abort();
@@ -177,7 +177,7 @@ function resetRoleData(role) {
     resourceGroups.admin.configuration.syncErrors = [];
     keyDirectory.clear();
   }
-  for (const entry of Object.values(resources[role])) Object.assign(entry, { value: null, error: "" });
+  for (const entry of Object.values(resources[role])) Object.assign(entry, { value: null, error: "", readAt: 0 });
   for (const group of Object.values(resourceGroups[role])) group.task = null;
   for (const page of Object.values(pages[role])) {
     page.task = null;
@@ -196,7 +196,6 @@ function privacyMaskButton(role) { return $((role === "account" ? "account-" : "
 function setPrivacyMask(role, masked) {
   const button = privacyMaskButton(role);
   button.setAttribute("aria-pressed", String(masked));
-  // setActionIcon would replace the descriptive title.
   button.replaceChildren(actionIcon(masked ? "eye-off" : "eye"));
   setTextAttribute(button, "aria-label", m("ui.mask"));
   document.body.classList.toggle("privacy-masked", masked);
@@ -297,14 +296,14 @@ for (const tab of TABS)
   tab.onclick = () => {
     if (activeTab(false) === tab.dataset.tab) return;
     setAdminTab(tab.dataset.tab);
-    guard(() => loadPage(false));
+    if (!refreshStalePage()) guard(() => loadPage(false));
   };
 
 document.querySelectorAll("[data-account-tab]").forEach((button) => {
   button.onclick = () => {
     if (activeTab(true) === button.dataset.accountTab) return;
     setAccountTab(button.dataset.accountTab);
-    guard(() => loadPage(true));
+    if (!refreshStalePage()) guard(() => loadPage(true));
   };
 });
 $("analysis-key").addEventListener("change", () =>
@@ -361,7 +360,7 @@ function addLanguageControl(group) {
       "aria-haspopup": "menu",
       "aria-expanded": "false",
       "aria-label": m("language.select"),
-      title: m("language.select"),
+      "data-tip": m("language.select"),
       onclick: () => {
         if (menu.matches(":popover-open")) return menu.hidePopover();
         const current = window.billingI18n.current();
@@ -382,7 +381,7 @@ function addLanguageControl(group) {
           )
         );
         menu.showPopover();
-        positionAnchoredPopover(menu, button, true);
+        positionAnchoredPopover(menu, button, { align: "end" });
         menu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
       }
     },
@@ -427,7 +426,7 @@ function updateRefreshButtons() {
     button.disabled = !!page?.task;
     setTextAttribute(
       button,
-      "title",
+      "data-tip",
       setTextAttribute(button, "aria-label", label ? m("ui.refresh_value", { v0: label }) : m("ui.refresh"))
     );
   }
@@ -437,6 +436,13 @@ function refreshPage() {
   if (!currentRole) return Promise.resolve();
   return currentPage().task || guard(() => loadPage(currentRole === "account", { reload: true }));
 }
+
+const PAGE_STALE_MS = 5 * 60 * 1000;
+function refreshStalePage() {
+  if (currentPage()?.sources.some((source) => source.readAt && Date.now() - source.readAt >= PAGE_STALE_MS)) return refreshPage();
+}
+
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refreshStalePage(); });
 
 for (const role of ["admin", "account"]) {
   const button = privacyMaskButton(role);
