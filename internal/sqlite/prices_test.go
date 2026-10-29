@@ -9,7 +9,7 @@ import (
 
 func TestCustomPriceUpdatesTouchOnlyTheirModelAndPublishAfterCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	store := billing.NewStore(func(path string) (billing.Repository, error) { return Open(path) }, nil)
+	store := billing.NewStore(func(path string) (billing.Repository, error) { return Open(path, nil) }, nil)
 	defer store.Close()
 	cfg := billing.DefaultConfig()
 	cfg.StateFile = path

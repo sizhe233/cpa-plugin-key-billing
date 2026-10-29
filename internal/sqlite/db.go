@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,16 +14,47 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"cpa-key-billing/internal/billing"
 )
 
-const schemaVersion = 17
+const schemaVersion = 24
 
 type DB struct {
 	db   *sql.DB
 	path string
 }
 
-func Open(path string) (*DB, error) {
+// StoredQuotaHeaders reads the quota report out of the headers a request stored
+// before schema 20; nil means the headers report nothing.
+type StoredQuotaHeaders func(provider string, headers http.Header, at time.Time) *billing.QuotaReport
+
+// Open opens the billing database at path, migrating older formats;
+// storedHeaders reads the quota headers that formats before schema 20 stored.
+func Open(path string, storedHeaders StoredQuotaHeaders) (*DB, error) {
+	database, err := connect(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := database.transact(func(tx *sql.Tx) error {
+		if err := database.initSchema(tx, storedHeaders); err != nil {
+			return err
+		}
+		for _, table := range slices.Sorted(maps.Keys(indexes)) {
+			if err := syncTableIndexes(tx, table, indexes[table]); err != nil {
+				return fmt.Errorf("Sync %s index: %w", table, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	return database, nil
+}
+
+// connect opens the database at path as it is.
+func connect(path string) (*DB, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("Create billing database directory %s: %w", dir, err)
@@ -39,32 +71,17 @@ func Open(path string) (*DB, error) {
 	handle.SetMaxOpenConns(1)
 	handle.SetMaxIdleConns(1)
 	handle.SetConnMaxLifetime(0)
-	database := &DB{db: handle, path: path}
-	if err := database.transact(func(tx *sql.Tx) error {
-		if err := database.initSchema(tx); err != nil {
-			return err
-		}
-		for _, table := range slices.Sorted(maps.Keys(indexes)) {
-			if err := syncTableIndexes(tx, table, indexes[table]); err != nil {
-				return fmt.Errorf("Sync %s index: %w", table, err)
-			}
-		}
-		return nil
-	}); err != nil {
-		_ = handle.Close()
-		return nil, err
-	}
-	return database, nil
+	return &DB{db: handle, path: path}, nil
 }
 
-func (d *DB) initSchema(tx *sql.Tx) error {
+func (d *DB) initSchema(tx *sql.Tx, storedHeaders StoredQuotaHeaders) error {
 	var version int
 	if err := tx.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("Read billing database %s: %w", d.path, err)
 	}
 	switch version {
-	case 10, 11, 12, 13, 14, 15, 16:
-		if err := migrateToV17(tx, version); err != nil {
+	case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23:
+		if err := migrateSchema(tx, version, storedHeaders); err != nil {
 			return err
 		}
 	case schemaVersion:

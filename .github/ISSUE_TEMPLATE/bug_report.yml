@@ -1,0 +1,41 @@
+name: 问题反馈 / Bug report
+description: 报告插件的错误或异常行为
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本 / Plugin version
+      description: 插件页面底部显示的版本号
+      placeholder: "1.4.6"
+    validations:
+      required: true
+  - type: input
+    id: cpa-version
+    attributes:
+      label: CLIProxyAPI 版本 / CLIProxyAPI version
+      description: 在管理面板首页或 CLIProxyAPI 启动日志中查看
+      placeholder: "8.0.37"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境 / Environment
+      description: 操作系统与架构、CPA 部署方式（Docker、二进制、Homebrew 等）
+      placeholder: "Linux amd64, Docker"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述 / Description
+      description: 发生了什么、期望的结果，以及复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与截图 / Logs and screenshots
+      description: 相关的插件日志、错误响应或截图。请先遮盖 API Key、邮箱和服务器地址。

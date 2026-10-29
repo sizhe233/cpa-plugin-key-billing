@@ -2,7 +2,7 @@ package billing
 
 import "testing"
 
-func TestConcurrencySlotsEnforceLimitAndAreIdempotent(t *testing.T) {
+func TestConcurrencySlotsEnforceLimit(t *testing.T) {
 	store := newStore(t)
 	store.ReplaceAll(func(state *State) {
 		state.Keys["scope-a"] = &KeyState{ConcurrencyLimit: 2}
@@ -14,14 +14,11 @@ func TestConcurrencySlotsEnforceLimitAndAreIdempotent(t *testing.T) {
 	if !first.Allowed || first.Active != 1 || !second.Allowed || second.Active != 2 {
 		t.Fatalf("admissions = %+v / %+v", first, second)
 	}
-	if blocked.Allowed || blocked.Active != 2 || blocked.Limit != 2 || blocked.Acquired {
+	if blocked.Allowed || blocked.Active != 2 || blocked.Limit != 2 {
 		t.Fatalf("blocked = %+v, want a saturated two-slot key", blocked)
 	}
-	if duplicate := store.AcquireSlot("scope-a", "request-2"); !duplicate.Allowed || duplicate.Active != 2 || duplicate.Acquired {
-		t.Fatalf("duplicate = %+v, want an idempotent reservation", duplicate)
-	}
-	if store.ReleaseSlot("missing") || !store.ReleaseSlot("request-1") || store.ReleaseSlot("request-1") {
-		t.Fatal("slot release was not idempotent")
+	if store.ReleaseSlot("missing") || !store.ReleaseSlot("request-1") {
+		t.Fatal("slot release did not match the reservation")
 	}
 	if admitted := store.AcquireSlot("scope-a", "request-3"); !admitted.Allowed || admitted.Active != 2 {
 		t.Fatalf("admitted after release = %+v", admitted)

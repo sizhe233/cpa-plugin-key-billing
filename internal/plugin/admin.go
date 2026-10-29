@@ -15,7 +15,6 @@ import (
 
 type keyRow struct {
 	billing.KeyView
-	RouteNames       map[string]string `json:"route_names"`
 	CredentialLabels map[string]string `json:"credential_labels"`
 }
 
@@ -28,13 +27,7 @@ func (a *App) keyRows() []keyRow {
 	keys := a.store.KeyViews()
 	rows := make([]keyRow, 0, len(keys))
 	for _, key := range keys {
-		names := make(map[string]string)
-		for _, id := range key.RouteBindings.RouteIDs {
-			if route, ok := a.store.Route(id); ok {
-				names[id] = route.Name
-			}
-		}
-		rows = append(rows, keyRow{KeyView: key, RouteNames: names, CredentialLabels: a.credentialLabels(key.RouteBindings.CredentialRefs())})
+		rows = append(rows, keyRow{KeyView: key, CredentialLabels: a.credentialLabels(key.RouteBindings.CredentialRefs())})
 	}
 	return rows
 }

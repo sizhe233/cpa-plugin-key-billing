@@ -3,8 +3,6 @@ package billing
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -51,8 +49,7 @@ type RoutePatch struct {
 
 type RoutingDecision struct {
 	RouteRule
-	Model              string
-	ConfigurationError string
+	Model string
 }
 
 func (d RoutingDecision) RestrictsModels() bool {
@@ -60,9 +57,6 @@ func (d RoutingDecision) RestrictsModels() bool {
 }
 
 func (d RoutingDecision) AllowsModel() bool {
-	if d.ConfigurationError != "" {
-		return false
-	}
 	if d.Model == "" {
 		return true
 	}
@@ -82,7 +76,7 @@ func (d RoutingDecision) RestrictsCredentials() bool {
 // ref is a fingerprint, never the raw host credential ID or an API key.
 func (d RoutingDecision) AllowsCredential(ref, source, provider string) bool {
 	selector := CredentialProviderSelector{Source: strings.ToLower(strings.TrimSpace(source)), Provider: strings.ToLower(strings.TrimSpace(provider))}
-	if d.ConfigurationError != "" || containsRouteValue(d.DeniedCredentialIDs, ref) {
+	if containsRouteValue(d.DeniedCredentialIDs, ref) {
 		return false
 	}
 	for _, denied := range d.DeniedCredentialProviders {
@@ -135,23 +129,6 @@ func CredentialFingerprint(rawID string) string {
 	_, _ = h.Write([]byte("cpa-key-billing:credential:v1\x00"))
 	_, _ = h.Write([]byte(rawID))
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
-}
-
-func (s *Store) ConfigCredentials() map[string]ConfigCredential {
-	var credentials map[string]ConfigCredential
-	s.read(func(state *State) { credentials = maps.Clone(state.ConfigCredentials) })
-	return credentials
-}
-
-func (s *Store) SyncConfigCredentials(credentials map[string]ConfigCredential) error {
-	_, err := editConfiguration(s, func(state *State) (struct{}, Changes, error) {
-		if maps.Equal(state.ConfigCredentials, credentials) {
-			return struct{}{}, Changes{}, nil
-		}
-		state.ConfigCredentials = maps.Clone(credentials)
-		return struct{}{}, Changes{ConfigCredentials: true}, nil
-	})
-	return err
 }
 
 func ValidCredentialFingerprint(value string) bool {
@@ -298,6 +275,15 @@ func (s *State) findRoute(id string) (Route, bool) {
 		return Route{}, false
 	}
 	return s.Routes[i], true
+}
+
+func (s *State) ValidateRouteBindings(bindings RouteBindings) error {
+	for _, id := range bindings.RouteIDs {
+		if _, ok := s.findRoute(id); !ok {
+			return notFoundf("Routing rule %q does not exist", id)
+		}
+	}
+	return nil
 }
 
 func cloneRoute(route Route) Route {
@@ -462,10 +448,8 @@ func (s *Store) SetKeyRoutes(scope string, bindings RouteBindings) error {
 		if key == nil {
 			return struct{}{}, Changes{}, notFoundf("API key %q does not exist", scope)
 		}
-		for _, id := range bindings.RouteIDs {
-			if _, ok := state.findRoute(id); !ok {
-				return struct{}{}, Changes{}, notFoundf("Routing rule %q does not exist", id)
-			}
+		if err := state.ValidateRouteBindings(bindings); err != nil {
+			return struct{}{}, Changes{}, err
 		}
 		key.RouteBindings = bindings
 		return struct{}{}, Changes{Keys: []string{scope}}, nil
@@ -511,7 +495,7 @@ func (s *Store) DeleteRoute(id string) (RouteDeleteResult, error) {
 
 func routingRestricted(state *State, key *KeyState) bool {
 	decision := resolveRoutingState(state, key)
-	return decision.ConfigurationError != "" || decision.RestrictsModels() || decision.RestrictsCredentials()
+	return decision.RestrictsModels() || decision.RestrictsCredentials()
 }
 
 func (s *Store) ResolveRouting(scope, upstreamModel, routeModel string) RoutingDecision {
@@ -521,6 +505,20 @@ func (s *Store) ResolveRouting(scope, upstreamModel, routeModel string) RoutingD
 		decision.Model = strings.TrimSpace(state.ResolveBillingModel(upstreamModel, routeModel))
 	})
 	return decision
+}
+
+// AllowedModels reports whether the key's model rules admit a request for
+// each model, resolving the billing model as admission does.
+func (s *Store) AllowedModels(scope string, models []string) []bool {
+	allowed := make([]bool, len(models))
+	s.read(func(state *State) {
+		decision := resolveRoutingState(state, state.Keys[normalizeScope(scope)])
+		for i, model := range models {
+			decision.Model = strings.TrimSpace(state.ResolveBillingModel(model, model))
+			allowed[i] = decision.AllowsModel()
+		}
+	})
+	return allowed
 }
 
 func (s *Store) KeyDescription(scope string) string {
@@ -547,11 +545,7 @@ func resolveRoutingState(state *State, key *KeyState) RoutingDecision {
 		d.DeniedCredentialProviders = append(d.DeniedCredentialProviders, rule.DeniedCredentialProviders...)
 	}
 	for _, id := range key.RouteBindings.RouteIDs {
-		route, ok := state.findRoute(id)
-		if !ok {
-			d.ConfigurationError = fmt.Sprintf("Routing rule %q no longer exists", id)
-			return d
-		}
+		route, _ := state.findRoute(id)
 		merge(route.Rule)
 	}
 	merge(key.RouteBindings.RouteRule)

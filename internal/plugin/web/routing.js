@@ -1,18 +1,20 @@
-let keyRouteSelection = { scope: "" };
+let keyRouteSelection = null;
 
-function editKeyRoutes(view) {
-  closeHoverTooltip();
+function editKeyRoutes(views, save) {
   openEditor("route-picker", "route", (data) => {
-    const key = data.keys.find((entry) => entry.scope === view.scope);
-    if (!key || key.deleted_at) throw new UIError(m("ui.this_api_key_no_longer_exists_refresh_the_list"));
+    const keys = views.map((view) => data.keys.find((key) => key.scope === view.scope));
+    if (keys.some((key) => !key || key.deleted_at)) throw new UIError(m("ui.this_api_key_no_longer_exists_refresh_the_list"));
+    const key = keys.length === 1 ? keys[0] : null;
     keyRouteSelection = {
-      scope: view.scope,
-      routeIDs: new Set(key.route_bindings.route_ids),
-      ...routingEditorState(key.route_bindings, "route-picker-enabled-only")
+      routeIDs: new Set(key?.route_bindings.route_ids || []),
+      routeNames: key?.route_names || {},
+      ...routingEditorState(key?.route_bindings, "route-picker-enabled-only")
     };
     $("route-picker-search").value = "";
-    setText($("route-picker-identity"), apiKeyIdentity(key).text);
+    $("route-picker-identity").classList.toggle("mask-blur", !!key);
+    setText($("route-picker-identity"), key ? apiKeyIdentity(key).text : m("ui.batch_routes_replace", { count: keys.length }));
     renderKeyRouteList();
+    return save;
   });
 }
 
@@ -60,9 +62,10 @@ function renderRouteRuleList() {
 function routingChoiceGroups(selection, data, term) {
   const groups = [];
   if (selection.routeIDs) {
-    const routes = data.routes.map((route) => ({ id: route.id, name: route.name || route.id }));
+    const routes = data.routes.slice();
+    // The route list is a separate read; a binding it missed still carries its name on the key.
     for (const id of selection.routeIDs) {
-      if (!routes.some((route) => route.id === id)) routes.push({ id, name: m("ui.routing_rule_no_longer_exists_value", { v0: id }) });
+      if (!routes.some((route) => route.id === id)) routes.push({ id, name: selection.routeNames[id] });
     }
     const choices = routes.filter((route) => matchesTerm(route.name, term))
       .map((route) => ({ kind: "route", value: route.id, label: route.name }));
@@ -132,15 +135,11 @@ function routingSection(selection, kind, title, options, rerender) {
         el("span", { text: title })
       ),
       kind === "credentials"
-        ? compactEnabledToggle(
-            selection.enabledOnly,
-            (checked) => {
-              selection.enabledOnly = checked;
-              saveViewPreference("admin", selection.preference, checked);
-              rerender();
-            },
-            m("ui.show_only_enabled_upstream_credentials")
-          )
+        ? compactEnabledToggle(selection.enabledOnly, (checked) => {
+            selection.enabledOnly = checked;
+            saveViewPreference("admin", selection.preference, checked);
+            rerender();
+          })
         : null,
       el("span", { class: "routing-section-count", text: selected + "/" + options.length })
     ),
@@ -154,10 +153,10 @@ function routingSection(selection, kind, title, options, rerender) {
   );
 }
 
-function compactEnabledToggle(checked, onChange, title) {
+function compactEnabledToggle(checked, onChange) {
   return el(
     "label",
-    { class: "toggle-filter compact-toggle", "data-tip": title },
+    { class: "toggle-filter compact-toggle" },
     switchControl({
       input: el("input", {
         type: "checkbox",
@@ -191,7 +190,7 @@ function routingDimensionChips(rule, kind, labels) {
           const credential = (resources.admin.credentials.value || []).find((item) => item.ref === ref);
           return {
             text: credential
-              ? maskedTailText(credential.provider, credentialName(credential))
+              ? maskedTailText(credential.provider_name, credentialName(credential))
               : labels?.[ref]
                 ? maskedLabelText(labels[ref])
                 : maskedTailText(m("ui.selected_upstream_credentialvaluevalue", { v0: "", v1: "" }), ref.slice(-8)),
@@ -223,14 +222,13 @@ function renderRoutes() {
         if (items.length && !items.some((item) => item.state === "allow")) items.unshift({ text: fallback, iconName });
         return settingsEntryField(label, settingsChipList(items, fallback));
       });
-      const name = route.name || route.id;
       return settingsCard(
-        name,
+        route.name,
         [...fields, boundKeyField(boundKeys)],
         () => editRoute(route),
         () =>
           openActionDialog(
-            m("ui.delete_routing_rule_value", { v0: name }),
+            m("ui.delete_routing_rule_value", { v0: route.name }),
             boundKeys.length
               ? m("ui.remove_this_rule_from_value_of_these_value_non_deleted_keys_will_have_unrestricted_mo", {
                   v0: bindingSummary(boundKeys),
@@ -315,8 +313,9 @@ function routeChoiceRow(selection, item, rerender) {
   const next = { none: "allow", allow: "deny", deny: "none" }[state];
   const names = { none: m("ui.not_selected"), allow: m("ui.allowlist"), deny: m("ui.denylist") };
   const key = kind + ":" + (kind === "provider" ? value.source + ":" + value.provider : value);
-  const title = m("ui.valuevalue_value_click_to_switch_to_value", {
-    v0: kind === "credential" && iconName ? m("ui.join", { v0: credentialSourceLabel(item.source), v1: DISPLAY_SEPARATOR, v2: "" }) : "",
+  const source = kind === "credential" && item.source ? credentialSourceLabel(item.source) : null;
+  const ariaLabel = m("ui.valuevalue_value_click_to_switch_to_value", {
+    v0: source ? m("ui.join", { v0: source, v1: DISPLAY_SEPARATOR, v2: "" }) : "",
     v1: label,
     v2: names[state],
     v3: names[next]
@@ -329,8 +328,19 @@ function routeChoiceRow(selection, item, rerender) {
       "data-state": state,
       "data-routing-choice": key,
       "data-routing-focus": key,
-      "data-tip": title,
-      "aria-label": title,
+      tooltip: () => [
+        el(
+          "div",
+          { class: "hover-tooltip-body" },
+          source ? m("ui.join", { v0: source, v1: DISPLAY_SEPARATOR, v2: "" }) : null,
+          chipText(text || label),
+          "\n",
+          m("ui.metric_value", { v0: m("ui.current_state"), v1: names[state] }),
+          "\n",
+          m("ui.metric_value", { v0: m("ui.click_to_switch_to"), v1: names[next] })
+        )
+      ],
+      "aria-label": ariaLabel,
       onclick: () => {
         setRouteChoice(selection, kind, value, next);
         rerender();
@@ -369,10 +379,10 @@ function routeCredentialChoices(selection, credentials, term) {
       kind: "credential",
       value: item.ref,
       label: credentialLabel(item),
-      text: maskedTailText(item.provider, credentialName(item)),
+      text: maskedTailText(item.provider_name, credentialName(item)),
       source: item.source,
       iconName: credentialIcon(item),
-      badge: item.disabled ? m("ui.disabled") : item.unavailable ? m("ui.none_available") : ""
+      badge: item.disabled ? m("ui.disabled") : item.unavailable ? m("ui.unavailable") : ""
     });
   }
   for (const ref of selectedRouteValues(selection, "credential")) {
@@ -382,7 +392,7 @@ function routeCredentialChoices(selection, credentials, term) {
         value: ref,
         label: m("ui.credential_no_longer_exists"),
         iconName: "key",
-        badge: m("ui.none_available")
+        badge: m("ui.unavailable")
       });
   }
   return options;
@@ -443,19 +453,15 @@ $("route-picker-search").addEventListener("input", renderKeyRouteList);
 $("route-picker-all").onclick = () => setVisibleRouteChoices("route-picker", keyRouteSelection, "allow", renderKeyRouteList);
 $("route-picker-deny-all").onclick = () => setVisibleRouteChoices("route-picker", keyRouteSelection, "deny", renderKeyRouteList);
 $("route-picker-save").onclick = () =>
-  submitEditor("route-picker", async () => {
-    await mutateAdmin("PUT", "/keys/routes", {
-      scope: keyRouteSelection.scope,
-      bindings: { route_ids: [...keyRouteSelection.routeIDs], ...routingPayload(keyRouteSelection) }
-    });
-    notify(m("ui.api_key_routing_rules_saved"));
-  });
+  submitEditor("route-picker", (editor) =>
+    editor.initial({ route_ids: [...keyRouteSelection.routeIDs], ...routingPayload(keyRouteSelection) })
+  );
 $("route-picker-clear").onclick = () => {
   keyRouteSelection.routeIDs.clear();
   Object.assign(keyRouteSelection, routingSelection());
   renderKeyRouteList();
 };
-$("route-picker").addEventListener("close", () => { if (!$("route-picker").open) keyRouteSelection = { scope: "" }; });
+$("route-picker").addEventListener("close", () => { if (!$("route-picker").open) keyRouteSelection = null; });
 $("route-rule-search").addEventListener("input", renderRouteRuleList);
 function setVisibleRouteChoices(id, selection, state, rerender) {
   const dialog = $(id);

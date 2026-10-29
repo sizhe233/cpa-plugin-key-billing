@@ -141,7 +141,7 @@ test("invalid server translation metadata falls back to the original message", (
   const params = Object.create({ v0: "inherited value" });
   assert.equal(i18n.serverMessage({ message_key: key, message_params: params }, fallback), fallback);
   assert.equal(String(i18n.serverMessage({ message_key: key, message_params: { v0: "custom 模型" } }, fallback)), "Translated server diagnostic: custom 模型");
-  assert.equal(String(i18n.serverMessage({ message_key: "ui.no_email_provided", message_params: null }, fallback)), "No email provided");
+  assert.equal(String(i18n.serverMessage({ message_key: "ui.no_api_key_configured", message_params: null }, fallback)), "No API key configured");
 });
 
 test("display helpers retain translatable labels instead of freezing the current language", () => {
@@ -150,13 +150,13 @@ test("display helpers retain translatable labels instead of freezing the current
     ["displayLabel", "matchesTerm"].includes(node.id.name)).map(node => source.slice(node.start, node.end)));
   assert.equal(functions.length, 2);
   env.evaluate(`const DISPLAY_SEPARATOR = " · "; const m = window.billingI18n.message;\n` + functions.join("\n"));
-  const label = env.evaluate('displayLabel(m("ui.no_email_provided"))');
+  const label = env.evaluate('displayLabel(m("ui.no_api_key_configured"))');
   assert.ok(env.i18n.isMessage(label));
-  assert.equal(String(label), "No email provided");
-  assert.ok(env.evaluate('matchesTerm(m("ui.no_email_provided"), "email")'));
+  assert.equal(String(label), "No API key configured");
+  assert.ok(env.evaluate('matchesTerm(m("ui.no_api_key_configured"), "api key")'));
   env.change("zh-CN");
-  assert.equal(String(label), "未提供邮箱");
-  assert.ok(env.evaluate('matchesTerm(m("ui.no_email_provided"), "邮箱")'));
+  assert.equal(String(label), "未配置 API Key");
+  assert.ok(env.evaluate('matchesTerm(m("ui.no_api_key_configured"), "配置")'));
 });
 
 test("English durations use singular and plural forms", () => {

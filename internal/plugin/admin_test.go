@@ -126,13 +126,13 @@ func TestPlansCRUDThroughTheManagementAPI(t *testing.T) {
 	}
 	callOK(t, app, http.MethodPost, routePlans, nil, map[string]any{
 		"name":    "Team Monthly",
-		"windows": []billing.QuotaWindow{{Name: "额度", AmountUSD: 20, PeriodSeconds: 2592000, CycleAnchorAt: anchor}},
+		"windows": []billing.QuotaWindow{{Name: "额度", Amount: 20, PeriodSeconds: 2592000, CycleAnchorAt: anchor}},
 	}, http.StatusCreated, &created)
 	if created.Plan.ID != "team-monthly" || created.Plan.Windows[0].PeriodSeconds != 2592000 || !created.Plan.Windows[0].CycleAnchorAt.Equal(anchor) {
 		t.Fatalf("plan = %+v", created.Plan)
 	}
 
-	if resp := callManagement(t, app, http.MethodPost, routePlans, nil, map[string]any{"id": created.Plan.ID, "windows": []billing.QuotaWindow{{Name: "额度", AmountUSD: 20, PeriodSeconds: 3600}}}); resp.StatusCode != http.StatusConflict {
+	if resp := callManagement(t, app, http.MethodPost, routePlans, nil, map[string]any{"id": created.Plan.ID, "windows": []billing.QuotaWindow{{Name: "额度", Amount: 20, PeriodSeconds: 3600}}}); resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate plan status = %d", resp.StatusCode)
 	}
 
@@ -141,9 +141,9 @@ func TestPlansCRUDThroughTheManagementAPI(t *testing.T) {
 	}
 	callOK(t, app, http.MethodPatch, routePlans, nil, map[string]any{
 		"id":      "team-monthly",
-		"windows": []billing.QuotaWindow{{ID: created.Plan.Windows[0].ID, Name: "额度", AmountUSD: 50, PeriodSeconds: 3600, CycleAnchorAt: anchor}},
+		"windows": []billing.QuotaWindow{{ID: created.Plan.Windows[0].ID, Name: "额度", Amount: 50, PeriodSeconds: 3600, CycleAnchorAt: anchor}},
 	}, http.StatusOK, &patched)
-	if patched.Plan.Windows[0].AmountUSD != 50 || patched.Plan.Windows[0].PeriodSeconds != 3600 || patched.Plan.Name != "Team Monthly" {
+	if patched.Plan.Windows[0].Amount != 50 || patched.Plan.Windows[0].PeriodSeconds != 3600 || patched.Plan.Name != "Team Monthly" {
 		t.Fatalf("plan = %+v", patched.Plan)
 	}
 
@@ -152,8 +152,8 @@ func TestPlansCRUDThroughTheManagementAPI(t *testing.T) {
 		t.Fatal("name edit removed schedule")
 	}
 	for _, windows := range [][]billing.QuotaWindow{
-		{{ID: created.Plan.Windows[0].ID, Name: "额度", AmountUSD: 50, PeriodSeconds: 3600, CycleAnchorAt: time.Now().Add(-time.Hour)}},
-		{{ID: created.Plan.Windows[0].ID, Name: "额度", AmountUSD: 50, PeriodSeconds: 3600, CycleAnchorAt: anchor}, {Name: "独立", AmountUSD: 1, PeriodSeconds: 7200}},
+		{{ID: created.Plan.Windows[0].ID, Name: "额度", Amount: 50, PeriodSeconds: 3600, CycleAnchorAt: time.Now().Add(-time.Hour)}},
+		{{ID: created.Plan.Windows[0].ID, Name: "额度", Amount: 50, PeriodSeconds: 3600, CycleAnchorAt: anchor}, {Name: "独立", Amount: 1, PeriodSeconds: 7200}},
 	} {
 		if resp := callManagement(t, app, http.MethodPatch, routePlans, nil, map[string]any{"id": created.Plan.ID, "windows": windows}); resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("invalid schedule status: %d", resp.StatusCode)
@@ -186,7 +186,7 @@ func TestKeyResetAcceptsScopeList(t *testing.T) {
 			callOK(t, app, http.MethodPost, routeKeysSync, nil,
 				map[string]any{"keys": keys}, http.StatusOK, nil)
 			callOK(t, app, http.MethodPost, routePlans, nil, map[string]any{
-				"id": "daily", "windows": []billing.QuotaWindow{{Name: "额度", AmountUSD: 10, PeriodSeconds: 86400, CycleAnchorAt: anchor}},
+				"id": "daily", "windows": []billing.QuotaWindow{{Name: "额度", Amount: 10, PeriodSeconds: 86400, CycleAnchorAt: anchor}},
 				"scopes": scopes,
 			}, http.StatusCreated, nil)
 			for _, scope := range scopes {
@@ -256,8 +256,8 @@ func TestManagementErrorsMapToStatusCodes(t *testing.T) {
 		body       any
 		wantStatus int
 	}{
-		{"zero plan amount", http.MethodPost, routePlans, map[string]any{"id": "x", "windows": []billing.QuotaWindow{{Name: "额度", AmountUSD: 0, PeriodSeconds: 86400}}}, http.StatusBadRequest},
-		{"invalid plan period", http.MethodPost, routePlans, map[string]any{"id": "x", "windows": []billing.QuotaWindow{{Name: "额度", AmountUSD: 1, PeriodSeconds: -1}}}, http.StatusBadRequest},
+		{"zero plan amount", http.MethodPost, routePlans, map[string]any{"id": "x", "windows": []billing.QuotaWindow{{Name: "额度", Amount: 0, PeriodSeconds: 86400}}}, http.StatusBadRequest},
+		{"invalid plan period", http.MethodPost, routePlans, map[string]any{"id": "x", "windows": []billing.QuotaWindow{{Name: "额度", Amount: 1, PeriodSeconds: -1}}}, http.StatusBadRequest},
 		{"unknown plan", http.MethodPatch, routePlans, map[string]any{"id": "ghost", "name": "Missing"}, http.StatusNotFound},
 		{"bind to unknown plan", http.MethodPost, routeKeysBind, map[string]any{"scope": "abc", "plan_id": "ghost"}, http.StatusNotFound},
 		{"no scope", http.MethodPost, routeKeysUnbind, map[string]any{}, http.StatusBadRequest},
@@ -277,14 +277,13 @@ func TestManagementErrorsMapToStatusCodes(t *testing.T) {
 }
 
 // The plaintext keys the panel pushes are hashed into caller scopes and
-// dropped; what comes back must name them by mask alone.
-func TestSyncKeysStoresOnlyMaskedKeys(t *testing.T) {
+// dropped; what comes back must name them by mask alone, in the pushed order.
+func TestSyncKeysStoresMaskedKeysInConfigOrder(t *testing.T) {
 	app := newConfiguredApp(t)
+	alpha, beta := "sk-alpha-000000001", "sk-beta-0000000002"
 
 	var result billing.SyncResult
-	callOK(t, app, http.MethodPost, routeKeysSync, nil, map[string]any{
-		"keys": []string{"sk-alpha-000000001", "sk-beta-0000000002"},
-	}, http.StatusOK, &result)
+	callOK(t, app, http.MethodPost, routeKeysSync, nil, map[string]any{"keys": []string{alpha, beta}}, http.StatusOK, &result)
 	if result.Added != 2 {
 		t.Fatalf("result = %+v", result)
 	}
@@ -299,6 +298,12 @@ func TestSyncKeysStoresOnlyMaskedKeys(t *testing.T) {
 		}
 		if strings.Contains(view.Preview, "alpha") || strings.Contains(view.Preview, "beta") {
 			t.Fatalf("Preview = %q leaks the key body", view.Preview)
+		}
+	}
+	for _, order := range [][]string{{beta, alpha}, {alpha, beta}} {
+		callOK(t, app, http.MethodPost, routeKeysSync, nil, map[string]any{"keys": order}, http.StatusOK, nil)
+		if keys := readKeys(t, app); keys[0].Scope != billing.CallerScope(order[0]) || keys[1].Scope != billing.CallerScope(order[1]) {
+			t.Fatalf("keys = %+v, want them in the synced order", keys)
 		}
 	}
 
@@ -366,17 +371,28 @@ func TestRequestEventQueryUsesABoundedDefaultPage(t *testing.T) {
 
 func TestManagementAnalysisOmitsTheSelectedKeyWindow(t *testing.T) {
 	app := newConfiguredApp(t)
-	const apiKey = "sk-analysis-0000000001"
-	callOK(t, app, http.MethodPost, routeKeysSync, nil, map[string]any{"keys": []string{apiKey}}, http.StatusOK, nil)
+	const apiKey, otherKey = "sk-analysis-0000000001", "sk-analysis-0000000002"
+	callOK(t, app, http.MethodPost, routeKeysSync, nil, map[string]any{"keys": []string{apiKey, otherKey}}, http.StatusOK, nil)
 	billOneRequest(t, app, apiKey, 20)
+	billOneRequest(t, app, otherKey, 30)
 
 	var view billing.AnalysisView
-	callOK(t, app, http.MethodGet, routeAnalysis, url.Values{
-		"api_key": {billing.CallerScope(apiKey)},
-	}, nil, http.StatusOK, &view)
+	selected := url.Values{"api_key": {billing.CallerScope(apiKey)}}
+	callOK(t, app, http.MethodGet, routeAnalysis, selected, nil, http.StatusOK, &view)
 	if len(view.UsageDistribution.APIKeys) != 0 || len(view.UsageDistribution.Models) != 1 ||
 		view.UsageDistribution.Models[0].Requests != 1 {
 		t.Fatalf("analysis = %+v", view)
+	}
+	// A row's breakdown stays within the selected key, whose window has no key rows.
+	var breakdown struct{ Models []billing.ModelUsage }
+	callOK(t, app, http.MethodGet, routeUsageModels, url.Values{"api_key": selected["api_key"], "dimension": {"sources"},
+		"value": {view.UsageDistribution.Sources[0].Filter}}, nil, http.StatusOK, &breakdown)
+	if len(breakdown.Models) != 1 || breakdown.Models[0].Requests != 1 {
+		t.Fatalf("source breakdown = %+v", breakdown)
+	}
+	if response := callManagement(t, app, http.MethodGet, routeUsageModels, url.Values{"api_key": selected["api_key"],
+		"dimension": {"api_keys"}, "value": {billing.CallerScope(otherKey)}}, nil); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("key rows under a selected key: status = %d", response.StatusCode)
 	}
 	response := callManagement(t, app, http.MethodGet, routeAnalysis, url.Values{
 		"from": {"2026-09-01T02:00:00Z"}, "to": {"2026-09-01T01:00:00Z"},
@@ -398,7 +414,7 @@ func TestManagementRoutesWorkWhileDisabled(t *testing.T) {
 		t.Fatalf("prices = %+v", prices)
 	}
 	callOK(t, app, http.MethodPost, routePlans, nil, map[string]any{
-		"id": "daily", "windows": []billing.QuotaWindow{{Name: "额度", AmountUSD: 1, PeriodSeconds: 86400}},
+		"id": "daily", "windows": []billing.QuotaWindow{{Name: "额度", Amount: 1, PeriodSeconds: 86400}},
 	}, http.StatusCreated, nil)
 }
 
@@ -552,122 +568,6 @@ func TestRouteMutationRefreshesInventoryAndNeverReturnsRawCredentialID(t *testin
 	}
 }
 
-func TestConfigCredentialSyncSurvivesRestartAndRollsBack(t *testing.T) {
-	app, path := newAppWithPriceAndState(t, true)
-	configuration := mustMarshal(t, LifecycleRequest{ConfigYAML: []byte(fmt.Sprintf("state_file: %q\n", path))})
-	const rawKey = "sk-dummy-upstream-secret-1234"
-	ref := billing.CredentialFingerprint("dummy-config")
-	removed := billing.CredentialFingerprint("dummy-removed")
-	if _, err := app.store.SyncKeys([]string{accountTestKeyA}, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.store.SetKeyRoutes(billing.CallerScope(accountTestKeyA), billing.RouteBindings{RouteRule: billing.RouteRule{CredentialIDs: []string{ref}}}); err != nil {
-		t.Fatal(err)
-	}
-	response := callManagement(t, app, http.MethodPost, routeCredentialsSync, nil, map[string]any{"credentials": []map[string]any{
-		{"ref": ref, "provider": "codex", "display_name": rawKey},
-		{"ref": removed, "provider": "codex", "display_name": "未配置 API Key", "disabled": true},
-	}})
-	if response.StatusCode != http.StatusOK || strings.Contains(string(response.Body), rawKey) {
-		t.Fatalf("sync response = %+v", response)
-	}
-	app.observeCandidates([]SchedulerAuthCandidate{{ID: "dummy-runtime", Provider: "codex", Attributes: map[string]string{"source_backend": "config"}}})
-	restart := func() {
-		app.Shutdown()
-		app = newTestApp(t)
-		t.Cleanup(app.Shutdown)
-		if err := app.configure(configuration); err != nil {
-			t.Fatal(err)
-		}
-		app.SetHostCaller(func(method string, _ any) (json.RawMessage, error) {
-			if method != hostAuthList {
-				t.Fatalf("host method = %q", method)
-			}
-			return json.RawMessage(`{"files":[{"id":"dummy-auth-file","provider":"codex","source":"file","email":"live@example.com"}]}`), nil
-		})
-	}
-	restart()
-	response = callAccount(t, app, routeRouting, accountTestKeyA, nil)
-	var routing accountRoutingResponse
-	if err := json.Unmarshal(response.Body, &routing); err != nil || response.StatusCode != http.StatusOK ||
-		!routing.RoutingValid || len(routing.Credentials) != 1 || routing.Credentials[0].Name != billing.PreviewKey(rawKey) ||
-		routing.Credentials[0].Status != "active" || len(routing.Warnings) != 0 {
-		t.Fatalf("routing after restart = %+v, response = %+v, err = %v", routing, response, err)
-	}
-	if snapshot := app.store.ConfigCredentials(); len(snapshot) != 2 || snapshot[removed].KeyPreview != "" || !snapshot[removed].Disabled {
-		t.Fatalf("persisted config snapshot = %+v", snapshot)
-	}
-	if inventory := app.credentialInventory(); len(inventory) != 3 {
-		t.Fatalf("host files and config snapshot were not merged: %+v", inventory)
-	}
-	app.observeCandidates([]SchedulerAuthCandidate{{ID: "dummy-config", Provider: "codex", Status: "cooldown", Attributes: map[string]string{"source_backend": "config"}}})
-	before := app.credentialInventory()
-	if err := app.configure(configuration); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(app.credentialInventory(), before) {
-		t.Fatal("reconfiguration replaced live credential state with the snapshot")
-	}
-
-	raw, err := sql.Open("sqlite3", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	if _, err := raw.Exec("CREATE TRIGGER reject_config BEFORE INSERT ON config_credentials BEGIN SELECT RAISE(ABORT, 'dummy failure'); END"); err != nil {
-		t.Fatal(err)
-	}
-	update := map[string]any{"credentials": []map[string]any{
-		{"ref": ref, "provider": "codex", "display_name": "sk-new…5678", "disabled": true},
-	}}
-	if response := callManagement(t, app, http.MethodPost, routeCredentialsSync, nil, update); response.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("failed sync response = %+v", response)
-	}
-	if !reflect.DeepEqual(app.credentialInventory(), before) || app.store.ConfigCredentials()[ref].KeyPreview != billing.PreviewKey(rawKey) {
-		t.Fatal("failed sync changed the live snapshot")
-	}
-	var stored int
-	if err := raw.QueryRow("SELECT count(*) FROM config_credentials").Scan(&stored); err != nil || stored != 2 {
-		t.Fatal("failed replacement lost persisted credentials", stored, err)
-	}
-	var preview string
-	if err := raw.QueryRow("SELECT key_preview FROM config_credentials WHERE ref = ?", ref).Scan(&preview); err != nil || preview != billing.PreviewKey(rawKey) {
-		t.Fatal("failed replacement changed the persisted preview", preview, err)
-	}
-	if _, err := raw.Exec("DROP TRIGGER reject_config"); err != nil {
-		t.Fatal(err)
-	}
-	callOK(t, app, http.MethodPost, routeCredentialsSync, nil, update, http.StatusOK, nil)
-	restart()
-	if inventory := app.credentialInventory(); len(inventory) != 1 || inventory[0].Ref != ref ||
-		inventory[0].DisplayName != "sk-new…5678" || !inventory[0].Disabled || inventory[0].Status != "disabled" {
-		t.Fatalf("replacement after restart = %+v", inventory)
-	}
-	if err := app.configure(mustMarshal(t, LifecycleRequest{ConfigYAML: testConfigYAML(t, true)})); err != nil {
-		t.Fatal(err)
-	}
-	if len(app.credentialInventory()) != 0 || len(app.store.ConfigCredentials()) != 0 {
-		t.Fatal("old config credentials survived a database switch")
-	}
-	if err := app.configure(configuration); err != nil {
-		t.Fatal(err)
-	}
-	if inventory := app.credentialInventory(); len(inventory) != 1 || inventory[0].Ref != ref || !inventory[0].Disabled {
-		t.Fatalf("config snapshot was not restored after switching back: %+v", inventory)
-	}
-	if err := app.refreshCredentialInventory(); err != nil {
-		t.Fatal(err)
-	}
-	callOK(t, app, http.MethodPost, routeCredentialsSync, nil, map[string]any{"credentials": []any{}}, http.StatusOK, nil)
-	if inventory := app.credentialInventory(); len(inventory) != 1 || inventory[0].Source != billing.CredentialSourceAuthFiles {
-		t.Fatalf("empty sync did not remove only config credentials: %+v", inventory)
-	}
-	restart()
-	if inventory := app.credentialInventory(); len(inventory) != 0 || len(app.store.ConfigCredentials()) != 0 {
-		t.Fatalf("cleared credentials reappeared after restart: %+v", inventory)
-	}
-}
-
 func TestPluginLogReportsStartupAndFailures(t *testing.T) {
 	app := newConfiguredApp(t)
 
@@ -782,7 +682,7 @@ func TestManagementWriteFailureReturnsError(t *testing.T) {
 	if _, err := app.store.SyncKeys([]string{apiKey}, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.store.CreatePlanWithBindings(billing.Plan{ID: "p", Windows: []billing.QuotaWindow{{Name: "额度", AmountUSD: 10, PeriodSeconds: 3600}}}, []string{scope}); err != nil {
+	if _, err := app.store.CreatePlanWithBindings(billing.Plan{ID: "p", Windows: []billing.QuotaWindow{{Name: "额度", Amount: 10, PeriodSeconds: 3600}}}, []string{scope}); err != nil {
 		t.Fatal(err)
 	}
 	app.store.Authorize(scope, app.store.Now())

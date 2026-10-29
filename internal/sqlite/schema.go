@@ -6,14 +6,28 @@ type index struct {
 
 // Non-unique indexes named <table>_<name> belong to this module.
 var indexes = map[string][]index{
+	// Names the sources of configured credentials' events.
+	"config_credentials": {
+		{"auth_index", "auth_index"},
+	},
 	"reference_prices": {
 		{"match_key", "match_key"},
 	},
 	"request_events": {
 		{"at", "at, id, failed"},
 		{"scope_at", "scope, at, id, failed"},
-		{"auth_at", "auth_index, at"},
+		// Covers credential usage, so its sums never read the wide rows.
+		{"auth_usage", "auth_index, at, provider, billing_model, upstream_model, failed, " +
+			"uncached_input_tokens, cache_read_tokens, cache_write_tokens, billed_output_tokens, currency, total_cost"},
 		{"model_at", eventModelSQL + ", at"},
+	},
+	"quota_reports": {
+		// Covers the newest values and the history of a credential's reports.
+		{"auth", "auth_index, provider, at, request_event_id, plan, credit_balance, credits_unlimited"},
+	},
+	"quota_report_windows": {
+		// Covers each window's reports in order, and so its newest one.
+		{"window", "auth_index, provider, limit_key, seconds, at, request_event_id, used_percent, reset_at, plan"},
 	},
 	"request_errors": {
 		{"status", "status_code, error_type"},
@@ -26,7 +40,36 @@ var indexes = map[string][]index{
 	},
 }
 
-// Time columns use Unix nanoseconds; JSON cycles use UTC RFC3339Nano.
+// quotaReportTables hold what each request's response reported about its
+// credential's quota. A window copies its report's credential, time and plan so
+// that each window's reports are an index range.
+const quotaReportTables = `
+CREATE TABLE quota_reports (
+	request_event_id  INTEGER PRIMARY KEY REFERENCES request_events(id) ON DELETE CASCADE,
+	auth_index        TEXT    NOT NULL,
+	provider          TEXT    NOT NULL,
+	at                INTEGER NOT NULL,
+	plan              TEXT    NOT NULL DEFAULT '',
+	credit_balance    TEXT    NOT NULL DEFAULT '',
+	credits_unlimited INTEGER
+);
+
+CREATE TABLE quota_report_windows (
+	request_event_id INTEGER NOT NULL REFERENCES quota_reports(request_event_id) ON DELETE CASCADE,
+	limit_key        TEXT    NOT NULL,
+	seconds          INTEGER NOT NULL,
+	auth_index       TEXT    NOT NULL,
+	provider         TEXT    NOT NULL,
+	at               INTEGER NOT NULL,
+	plan             TEXT    NOT NULL DEFAULT '',
+	used_percent     REAL    NOT NULL,
+	reset_at         INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (request_event_id, limit_key, seconds)
+) WITHOUT ROWID;
+`
+
+// Time columns use Unix nanoseconds; JSON cycles use UTC RFC3339Nano. Amounts
+// are in the currency of their row.
 const schema = `
 CREATE TABLE api_keys (
 	scope                 TEXT    PRIMARY KEY,
@@ -48,17 +91,27 @@ CREATE TABLE routes (
 );
 
 CREATE TABLE config_credentials (
-	ref         TEXT PRIMARY KEY,
-	provider    TEXT NOT NULL,
-	key_preview TEXT NOT NULL DEFAULT '',
-	disabled    INTEGER NOT NULL DEFAULT 0
+	ref          TEXT PRIMARY KEY,
+	provider     TEXT NOT NULL,
+	key_preview  TEXT NOT NULL DEFAULT '',
+	disabled     INTEGER NOT NULL DEFAULT 0,
+	auth_index   TEXT NOT NULL DEFAULT '',
+	type         TEXT NOT NULL DEFAULT '',
+	name         TEXT NOT NULL DEFAULT '',
+	base_url     TEXT NOT NULL DEFAULT '',
+	priority     INTEGER NOT NULL DEFAULT 0,
+	weight       INTEGER NOT NULL DEFAULT 1,
+	balance_json TEXT NOT NULL DEFAULT 'null',
+	config_ref   TEXT NOT NULL DEFAULT '',
+	note         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE plans (
 	position        INTEGER PRIMARY KEY,
 	id              TEXT    NOT NULL UNIQUE,
 	name            TEXT    NOT NULL DEFAULT '',
-	windows_json    TEXT    NOT NULL
+	windows_json    TEXT    NOT NULL,
+	currency        TEXT    NOT NULL DEFAULT 'USD'
 );
 
 CREATE TABLE prices (
@@ -72,7 +125,8 @@ CREATE TABLE prices (
 	long_context_input_per_1m       REAL,
 	long_context_output_per_1m      REAL,
 	long_context_cache_read_per_1m  REAL,
-	long_context_cache_write_per_1m REAL
+	long_context_cache_write_per_1m REAL,
+	currency                        TEXT    NOT NULL DEFAULT 'USD'
 );
 
 CREATE TABLE reference_prices_metadata (
@@ -117,11 +171,11 @@ CREATE TABLE request_events (
 	accounting_quality          TEXT    NOT NULL DEFAULT '',
 	price_source                TEXT    NOT NULL DEFAULT '',
 	reasoning_tokens            INTEGER NOT NULL DEFAULT 0,
-	total_usd                   REAL    NOT NULL DEFAULT 0,
-	uncached_input_usd          REAL    NOT NULL DEFAULT 0,
-	cache_read_usd              REAL    NOT NULL DEFAULT 0,
-	cache_write_usd             REAL    NOT NULL DEFAULT 0,
-	output_usd                  REAL    NOT NULL DEFAULT 0,
+	total_cost                  REAL    NOT NULL DEFAULT 0,
+	uncached_input_cost         REAL    NOT NULL DEFAULT 0,
+	cache_read_cost             REAL    NOT NULL DEFAULT 0,
+	cache_write_cost            REAL    NOT NULL DEFAULT 0,
+	output_cost                 REAL    NOT NULL DEFAULT 0,
 	uncached_input_tokens       INTEGER NOT NULL DEFAULT 0,
 	cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
 	cache_write_tokens          INTEGER NOT NULL DEFAULT 0,
@@ -133,7 +187,13 @@ CREATE TABLE request_events (
 	applied_output_per_1m       REAL    NOT NULL DEFAULT 0,
 	applied_cache_read_per_1m   REAL    NOT NULL DEFAULT 0,
 	applied_cache_write_per_1m  REAL    NOT NULL DEFAULT 0,
-	response_headers_json       TEXT    NOT NULL DEFAULT '{}'
+	endpoint                    TEXT    NOT NULL DEFAULT '',
+	transport                   TEXT    NOT NULL DEFAULT '',
+	stream                      INTEGER,
+	execution_json              TEXT    NOT NULL DEFAULT 'null',
+	user_agent                  TEXT    NOT NULL DEFAULT '',
+	x_forwarded_for             TEXT    NOT NULL DEFAULT '',
+	currency                    TEXT    NOT NULL DEFAULT 'USD'
 );
 
 CREATE TABLE request_errors (
@@ -143,6 +203,7 @@ CREATE TABLE request_errors (
 	body             TEXT    NOT NULL DEFAULT ''
 );
 
+` + quotaReportTables + `
 CREATE TABLE plugin_logs (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT,
 	at      INTEGER NOT NULL,

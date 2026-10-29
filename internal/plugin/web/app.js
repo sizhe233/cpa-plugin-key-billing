@@ -1,3 +1,117 @@
+const PAGE_REFRESH_INTERVALS = [0, 5, 10, 30, 60, 300];
+const PAGE_STALE_MS = 5 * 60 * 1000;
+let pageRefreshTimer = 0;
+let pageRefreshTarget = null;
+
+function pendingPageLoads(page) {
+  // Filters and pagination can read sources outside a full-page load.
+  return page ? [page.task, ...page.sources.map((source) => source.task)].filter(Boolean) : [];
+}
+
+function clearPageRefresh() {
+  clearTimeout(pageRefreshTimer);
+  pageRefreshTimer = 0;
+  pageRefreshTarget = null;
+}
+
+// One deadline belongs to the visible page. Loads restart it on completion;
+// hiding the document pauses the timer while retaining an overdue deadline.
+function schedulePageRefresh(page, loading) {
+  const seconds = currentRole ? Number($((currentRole === "account" ? "account-" : "") + "auto-refresh").value) : 0;
+  if (!page?.autoRefresh || !seconds || loading) {
+    clearPageRefresh();
+    return;
+  }
+  if (pageRefreshTarget?.page !== page || pageRefreshTarget.generation !== sessionGeneration || pageRefreshTarget.seconds !== seconds) {
+    clearPageRefresh();
+    pageRefreshTarget = { page, generation: sessionGeneration, seconds, dueAt: Date.now() + seconds * 1000 };
+  }
+  if (document.visibilityState !== "visible") {
+    clearTimeout(pageRefreshTimer);
+    pageRefreshTimer = 0;
+    return;
+  }
+  if (pageRefreshTimer) return;
+  const target = pageRefreshTarget;
+  pageRefreshTimer = setTimeout(
+    () => {
+      clearPageRefresh();
+      if (currentPage() !== target.page || sessionGeneration !== target.generation || document.visibilityState !== "visible") {
+        updateRefreshControls();
+        return;
+      }
+      refreshPage();
+    },
+    Math.max(0, target.dueAt - Date.now())
+  );
+}
+
+function updateRefreshControls() {
+  const page = currentPage();
+  const loading = pendingPageLoads(page).length > 0;
+  const label = currentRole
+    ? document.querySelector(currentRole === "account" ? "[data-account-tab].active" : "[data-tab].active")?.textContent.trim()
+    : "";
+  for (const button of document.querySelectorAll('[data-page-action="refresh"]')) {
+    button.disabled = loading;
+    setTextAttribute(
+      button,
+      "data-tip",
+      setTextAttribute(button, "aria-label", label ? m("ui.refresh_value", { v0: label }) : m("ui.refresh"))
+    );
+  }
+  schedulePageRefresh(page, loading);
+}
+
+function refreshPage() {
+  const page = currentPage();
+  if (!page) return Promise.resolve();
+  const pending = pendingPageLoads(page);
+  return guard(() => (pending.length ? settleLoads(pending) : loadPage(currentRole === "account", { reload: true })));
+}
+
+function refreshStalePage() {
+  if (currentPage()?.sources.some((source) => source.readAt && Date.now() - source.readAt >= PAGE_STALE_MS)) return refreshPage();
+}
+
+for (const role of ["admin", "account"]) {
+  const select = $((role === "account" ? "account-" : "") + "auto-refresh");
+  select.replaceChildren(
+    ...PAGE_REFRESH_INTERVALS.map((seconds) =>
+      el("option", {
+        value: String(seconds),
+        text: seconds ? m("ui.auto_refresh_every", { v0: seconds < 60 ? seconds + "s" : seconds / 60 + "m" }) : m("ui.auto_refresh_off")
+      })
+    )
+  );
+  select.onchange = () => {
+    saveChoice(role, select.id);
+    updateRefreshControls();
+  };
+  const currency = $((role === "account" ? "account-" : "") + "display-currency");
+  currency.replaceChildren(el("option", { value: "auto", text: m("ui.currency_auto") }), ...currencyOptions());
+  currency.onchange = () => {
+    saveChoice(role, currency.id);
+    renderPage();
+  };
+}
+
+function renderDisplayCurrency() {
+  const { rate } = moneyChoice();
+  const control = $((currentRole === "account" ? "account-" : "") + "display-currency-control");
+  setTextAttribute(control, "data-tip", rate ? m("ui.exchange_rate_value", { v0: rate }) : "");
+}
+
+for (const button of document.querySelectorAll('[data-page-action="refresh"]')) {
+  setActionIcon(button, "refresh", m("ui.refresh"));
+  button.onclick = () => refreshPage();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") refreshStalePage();
+  updateRefreshControls();
+});
+
 async function setLoginMode(mode, preserveError) {
   const ticket = ++loginModeRequest;
   loginMode = mode === "account" ? "account" : "admin";
@@ -5,7 +119,7 @@ async function setLoginMode(mode, preserveError) {
   const tab = route.role === loginMode ? route.tab : loginMode === "account" ? "subscription" : "keys";
   writePageRoute(loginMode, tab);
   const account = loginMode === "account";
-  setText(document.querySelector("title"), m(account ? "ui.api_key_usage" : "ui.api_key_billing"));
+  setText(document.querySelector("title"), account ? m("ui.api_key_usage") : PRODUCT_NAME);
   $("gate-mode-admin").classList.toggle("active", !account);
   $("gate-mode-admin").setAttribute("aria-selected", String(!account));
   $("gate-mode-account").classList.toggle("active", account);
@@ -27,6 +141,7 @@ async function setLoginMode(mode, preserveError) {
 
 function showGate(mode, error) {
   sessionGeneration++;
+  clearTableSelection();
   hideNotice();
   closeHoverTooltip();
   try { sessionStorage.removeItem(SESSION_CREDENTIAL_PREFIX + mode); } catch (_) {}
@@ -38,6 +153,7 @@ function showGate(mode, error) {
   }
   authKey = "";
   currentRole = "";
+  updateRefreshControls();
   document.body.classList.remove("privacy-masked");
   $("app").classList.add("hidden");
   $("account-app").classList.add("hidden");
@@ -82,7 +198,7 @@ $("gate-mode-admin").onclick = () => setLoginMode("admin");
 $("gate-mode-account").onclick = () => setLoginMode("account");
 
 async function startAdmin(key) {
-  setText(document.querySelector("title"), m("ui.api_key_billing"));
+  setText(document.querySelector("title"), PRODUCT_NAME);
   const generation = sessionGeneration;
   currentRole = "admin";
   authKey = key;
@@ -129,11 +245,16 @@ function restoreRolePreferences(role) {
   restoreChoice(role, prefix + "request-event-status", "");
   restoreChoice(role, prefix + "auth-enabled-only", true);
   restoreChoice(role, prefix + "auth-provider", "");
+  restoreChoice(role, prefix + "ai-provider-enabled-only", true);
+  restoreChoice(role, prefix + "ai-provider-type", "");
+  restoreChoice(role, prefix + "auto-refresh", "0");
+  restoreChoice(role, prefix + "display-currency", "auto");
   setPrivacyMask(role, viewPreference(role, prefix + "privacy-mask", false));
   if (!account) {
     restoreChoice(role, "analysis-key", "", true);
     if ($("analysis-key").value === UNASSIGNED_KEY) $("analysis-key").selectedOptions[0].textContent = m("ui.unassigned");
     restoreChoice(role, "keys-include-deleted", false);
+    restoreChoice(role, "auth-quota-estimate", false);
     restoreChoice(role, "plugin-log-level", "all");
   }
   sharedTimeRanges[role] = storedTimeRange(role);
@@ -158,6 +279,7 @@ function resetRoleControls(role) {
   closeSharedTimePopover(account);
   setPrivacyMask(role, false);
   $(prefix + "auth-search").value = "";
+  $(prefix + "ai-provider-search").value = "";
   if (!account) {
     $("key-filter").value = "";
     $("keys-include-deleted").checked = false;
@@ -169,6 +291,7 @@ function resetRoleControls(role) {
 function resetRoleData(role) {
   const account = role === "account";
   destroyAnalysisCharts(account);
+  speedModels[role] = "";
   if (role === "account") accountUIState = emptyAuthQuotaState();
   else {
     $("route-picker").close();
@@ -184,7 +307,11 @@ function resetRoleData(role) {
     for (const section of page.sections) section.displayed = null;
   }
   analysisQueries[role].clear();
-  if (!account) eventKeysQuery.clear();
+  speedQueries[role].clear();
+  authFilesQueries[role].clear();
+  aiProvidersQueries[role].clear();
+  modelUsages[role].clear();
+  if (!account) { eventKeysQuery.clear(); }
   for (const list of Object.values(pagedLists[role])) list.reset();
   resetRoleControls(role);
 }
@@ -255,6 +382,23 @@ for (const element of document.querySelectorAll(".head, #admin-data-status, #acc
   pageTabResizeObserver.observe(element, { box: "border-box" });
 }
 
+function updatePageControls(account, page) {
+  const prefix = account ? "account-" : "";
+  const actions = $(prefix + "page-tab-actions");
+  const keyed = !account && page.sources.includes(eventKeysQuery);
+  actions.dataset.page = activeTab(account);
+  actions.classList.toggle("has-key-filter", keyed);
+  $(prefix + "shared-time-filter").classList.toggle("hidden", !page.timeRange);
+  $(prefix + "display-currency-control").classList.toggle("hidden", !page.currency);
+  $(prefix + "auto-refresh-control").classList.toggle("hidden", !page.autoRefresh);
+  $(prefix + "request-event-columns").classList.toggle("hidden", !page.eventColumns);
+  $(prefix + "events-export").classList.toggle("hidden", !page.exportEvents);
+  if (!account) $("shared-key-filter").classList.toggle("hidden", !keyed);
+  if (!page.timeRange) closeSharedTimePopover(account);
+  updateRefreshControls();
+  schedulePageTabLayout();
+}
+
 function setAccountTab(tab) {
   accountTab = ACCOUNT_TAB_IDS.includes(tab) ? tab : "subscription";
   writePageRoute("account", accountTab);
@@ -265,16 +409,14 @@ function setAccountTab(tab) {
   });
   $("account-page-tab-select").value = accountTab;
   for (const name of ACCOUNT_TAB_IDS) { $("account-tab-" + name).classList.toggle("hidden", name !== accountTab); }
-  $("account-shared-time-filter").classList.toggle("hidden", !["analysis", "request-events", "errors"].includes(accountTab));
-  $("account-events-export").classList.toggle("hidden", !["request-events", "errors"].includes(accountTab));
-  if (!["analysis", "request-events", "errors"].includes(accountTab)) { closeSharedTimePopover(true); }
-  schedulePageTabLayout();
+  updatePageControls(true, pages.account[accountTab]);
 }
 
 const TABS = Array.from(document.querySelectorAll(".tabs button[data-tab]"));
 function setAdminTab(name) {
-  if (editors.get($("route-picker"))?.saving) return;
+  if (editors.get($("route-picker"))?.saving || activeTableSelection?.busy) return;
   const selected = ADMIN_TAB_IDS.includes(name) ? name : "keys";
+  if (selected !== activeTab(false)) clearTableSelection();
   if (selected !== "keys") $("route-picker").close();
   writePageRoute("admin", selected);
   for (const tab of TABS) {
@@ -284,13 +426,10 @@ function setAdminTab(name) {
   }
   $("page-tab-select").value = selected;
   const visible = selected === "settings" ? new Set(["plans", "routes", "prices", "plugin-logs"]) : new Set([selected]);
-  for (const section of ["keys", "analysis", "plans", "routes", "prices", "request-events", "errors", "auth-files", "plugin-logs"]) {
-    $("tab-" + section).classList.toggle("hidden", !visible.has(section));
+  for (const section of document.querySelectorAll('#app > section[id^="tab-"]')) {
+    section.classList.toggle("hidden", !visible.has(section.id.slice("tab-".length)));
   }
-  $("shared-time-filter").classList.toggle("hidden", !["analysis", "request-events", "errors"].includes(selected));
-  $("events-export").classList.toggle("hidden", !["request-events", "errors"].includes(selected));
-  if (!["analysis", "request-events", "errors"].includes(selected)) { closeSharedTimePopover(false); }
-  schedulePageTabLayout();
+  updatePageControls(false, pages.admin[selected]);
 }
 for (const tab of TABS)
   tab.onclick = () => {
@@ -319,8 +458,8 @@ const THEME_MODES = {
   dark: { icon: "moon", label: () => m("ui.theme_dark") }
 };
 function updateThemeButtons() {
-  const mode = THEME_MODES[window.billingTheme?.preference()] || THEME_MODES[""];
-  document.querySelectorAll('[data-page-action="theme"]').forEach((button) => setActionIcon(button, mode.icon, mode.label()));
+  const mode = THEME_MODES[window.billingTheme.preference()];
+  document.querySelectorAll('[data-page-action="theme"]').forEach((button) => button.replaceChildren(actionIcon(mode.icon)));
 }
 
 function updateThemedVisuals() {
@@ -328,16 +467,6 @@ function updateThemedVisuals() {
   if (currentRole && activeTab(currentRole === "account") === "analysis") renderAnalysis(currentRole === "account");
 }
 
-for (const button of document.querySelectorAll('[data-page-action="refresh"]')) {
-  setActionIcon(button, "refresh", m("ui.refresh"));
-  button.onclick = () => refreshPage();
-}
-document.querySelectorAll('[data-page-action="theme"]').forEach((button) => {
-  button.onclick = () => {
-    window.billingTheme?.cycle();
-    updateThemeButtons();
-  };
-});
 document.querySelectorAll('[data-page-action="logout"]').forEach((button) => {
   setActionIcon(button, "logout", m("ui.sign_out"));
   button.onclick = () =>
@@ -349,44 +478,32 @@ document.querySelectorAll('[data-page-action="logout"]').forEach((button) => {
       showGate(role, "");
     });
 });
-function addLanguageControl(group) {
-  const menu = el("div", { class: "language-menu", popover: "auto", role: "menu", "aria-label": m("language.select") });
-  const button = el(
-    "button",
-    {
-      type: "button",
-      class: "icon-action",
-      "data-page-action": "language",
-      "aria-haspopup": "menu",
-      "aria-expanded": "false",
-      "aria-label": m("language.select"),
-      "data-tip": m("language.select"),
-      onclick: () => {
-        if (menu.matches(":popover-open")) return menu.hidePopover();
-        const current = window.billingI18n.current();
-        menu.replaceChildren(
-          ...window.billingI18n.languages().map((item) =>
-            el("button", {
-              type: "button",
-              class: "language-option",
-              role: "menuitemradio",
-              "aria-checked": String(item.value === current),
-              text: item.label,
-              onclick: () => {
-                menu.hidePopover();
-                button.focus();
-                window.billingI18n.select(item.value);
-              }
-            })
-          )
-        );
-        menu.showPopover();
-        positionAnchoredPopover(menu, button, { align: "end" });
-        menu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
-      }
-    },
-    actionIcon("globe")
-  );
+function attachSelectionMenu(button, label, choices, select) {
+  const menu = el("div", { class: "selection-menu", popover: "auto", role: "menu", "aria-label": label });
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  button.onclick = () => {
+    if (menu.matches(":popover-open")) return menu.hidePopover();
+    menu.replaceChildren(
+      ...choices().map((item) =>
+        el("button", {
+          type: "button",
+          class: "selection-option",
+          role: "menuitemradio",
+          "aria-checked": String(item.selected),
+          text: item.label,
+          onclick: () => {
+            menu.hidePopover();
+            button.focus();
+            select(item.value);
+          }
+        })
+      )
+    );
+    menu.showPopover();
+    positionAnchoredPopover(menu, button, { align: "end" });
+    menu.querySelector('[aria-checked="true"]').focus({ preventScroll: true });
+  };
   menu.addEventListener("toggle", (event) => button.setAttribute("aria-expanded", String(event.newState === "open")));
   menu.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
@@ -402,9 +519,36 @@ function addLanguageControl(group) {
     const index = items.indexOf(document.activeElement);
     items[(index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
   });
-  group.prepend(button, menu);
+  button.after(menu);
 }
-document.querySelectorAll(".standalone-actions").forEach(addLanguageControl);
+document.querySelectorAll(".standalone-actions").forEach((group) => {
+  const language = el(
+    "button",
+    { type: "button", class: "icon-action", "data-page-action": "language", "aria-label": m("language.select") },
+    actionIcon("globe")
+  );
+  group.prepend(language);
+  attachSelectionMenu(
+    language,
+    m("language.select"),
+    () => window.billingI18n.languages().map((item) => ({ ...item, selected: item.value === window.billingI18n.current() })),
+    (value) => window.billingI18n.select(value)
+  );
+  attachSelectionMenu(
+    group.querySelector('[data-page-action="theme"]'),
+    m("ui.switch_theme"),
+    () =>
+      Object.entries(THEME_MODES).map(([value, mode]) => ({
+        value,
+        label: mode.label(),
+        selected: value === window.billingTheme.preference()
+      })),
+    (value) => {
+      window.billingTheme.select(value);
+      updateThemeButtons();
+    }
+  );
+});
 
 window.addEventListener("billing-theme-change", updateThemedVisuals);
 window.addEventListener("billing-language-change", () => {
@@ -416,33 +560,6 @@ window.addEventListener("billing-language-change", () => {
   renderPage();
   schedulePageTabLayout();
 });
-
-function updateRefreshButtons() {
-  const page = currentPage();
-  const label = currentRole
-    ? document.querySelector(currentRole === "account" ? "[data-account-tab].active" : "[data-tab].active")?.textContent.trim()
-    : "";
-  for (const button of document.querySelectorAll('[data-page-action="refresh"]')) {
-    button.disabled = !!page?.task;
-    setTextAttribute(
-      button,
-      "data-tip",
-      setTextAttribute(button, "aria-label", label ? m("ui.refresh_value", { v0: label }) : m("ui.refresh"))
-    );
-  }
-}
-
-function refreshPage() {
-  if (!currentRole) return Promise.resolve();
-  return currentPage().task || guard(() => loadPage(currentRole === "account", { reload: true }));
-}
-
-const PAGE_STALE_MS = 5 * 60 * 1000;
-function refreshStalePage() {
-  if (currentPage()?.sources.some((source) => source.readAt && Date.now() - source.readAt >= PAGE_STALE_MS)) return refreshPage();
-}
-
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refreshStalePage(); });
 
 for (const role of ["admin", "account"]) {
   const button = privacyMaskButton(role);

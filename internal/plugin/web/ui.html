@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title data-i18n="ui.api_key_billing">API Key Billing</title>
+    <title>CPA Key Billing</title>
     <script>
       /*standalone.js*/
     </script>
@@ -12,6 +12,7 @@
     </script>
     <style>
       /*style.css*/
+      /*table-selection.css*/
     </style>
     <script>
       /*theme.js*/
@@ -26,7 +27,7 @@
             <button type="button" class="icon-action" data-page-action="theme" aria-label="Switch theme" data-i18n-aria-label="ui.switch_theme"></button>
           </div>
         </div>
-        <div class="access-switch" role="tablist" aria-label="Access method" data-i18n-aria-label="ui.access_method">
+        <div class="segmented-control" role="tablist" aria-label="Access method" data-i18n-aria-label="ui.access_method">
           <button id="gate-mode-admin" type="button" role="tab" aria-selected="true" class="active" data-i18n="ui.management_key">Management key</button>
           <button id="gate-mode-account" type="button" role="tab" aria-selected="false" data-i18n="ui.api_key_access">API key</button>
         </div>
@@ -44,7 +45,7 @@
 
       <main id="app" class="hidden">
         <header class="head app-header">
-          <div class="app-title"><h1><span data-lucide-icon="key" aria-hidden="true"></span><span data-i18n="ui.api_key_billing">API Key Billing</span></h1></div>
+          <div class="app-title"><h1><span data-lucide-icon="key" aria-hidden="true"></span><span>CPA Key Billing</span></h1></div>
           <div class="standalone-actions" aria-label="Page actions" data-i18n-aria-label="ui.page_actions">
             <button type="button" class="icon-action" data-page-action="theme" aria-label="Switch theme" data-i18n-aria-label="ui.switch_theme"></button>
             <button type="button" class="icon-action" data-page-action="logout" aria-label="Sign out" data-i18n-aria-label="ui.sign_out"></button>
@@ -60,6 +61,7 @@
                 <button type="button" data-tab="request-events" data-i18n="ui.request_events">Request events</button>
                 <button type="button" data-tab="errors" data-i18n="ui.error_events">Error events</button>
                 <button type="button" data-tab="auth-files" data-i18n="ui.auth_files">Auth Files</button>
+                <button type="button" data-tab="ai-providers" data-i18n="ui.ai_providers">AI Providers</button>
                 <button type="button" data-tab="settings" data-i18n="ui.settings">Settings</button>
               </div>
               <span class="native-select page-tab-select">
@@ -78,21 +80,28 @@
               <button type="button" class="icon-action" data-page-action="refresh" aria-label="Refresh" data-i18n-aria-label="ui.refresh"></button>
             </div>
           </nav>
-          <div class="page-tab-actions hidden">
-            <div id="shared-time-filter" class="shared-time-filter hidden">
-              <span class="native-select mask-select">
-                <select id="analysis-key" aria-label="Filter by API key" data-i18n-aria-label="ui.filter_by_api_key"> <option value="" data-i18n="ui.all_api_keys">All API keys</option> </select>
-              </span>
-              <div class="time-range-control">
-                <button id="shared-time-trigger" class="time-range-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
-                  <span class="time-range-icon" data-lucide-icon="clock" aria-hidden="true"></span>
-                  <span id="shared-time-label" data-i18n="ui.last_30_days">Last 30 days</span>
-                  <span class="time-range-chevron" data-lucide-icon="chevron-down" aria-hidden="true"></span>
-                </button>
-                <div id="shared-time-popover" class="time-range-popover hidden" role="dialog" aria-label="Select time range" data-i18n-aria-label="ui.select_time_range"></div>
-              </div>
+          <div id="page-tab-actions" class="page-tab-actions hidden">
+            <span id="shared-key-filter" class="native-select mask-select page-key-filter hidden">
+              <select id="analysis-key" aria-label="Filter by API key" data-i18n-aria-label="ui.filter_by_api_key"> <option value="" data-i18n="ui.all_api_keys">All API keys</option> </select>
+            </span>
+            <div id="shared-time-filter" class="time-range-control hidden">
+              <button id="shared-time-trigger" class="time-range-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span class="time-range-icon" data-lucide-icon="clock" aria-hidden="true"></span>
+                <span id="shared-time-label" data-i18n="ui.last_30_days">Last 30 days</span>
+                <span class="time-range-chevron" data-lucide-icon="chevron-down" aria-hidden="true"></span>
+              </button>
+              <div id="shared-time-popover" class="time-range-popover hidden" role="dialog" aria-label="Select time range" data-i18n-aria-label="ui.select_time_range"></div>
             </div>
-            <button id="events-export" class="labeled-icon-button hidden" type="button" data-tip="Export" data-i18n-data-tip="ui.export" data-i18n="ui.export">Export</button>
+            <span id="display-currency-control" class="native-select display-currency-control hidden">
+              <span class="native-select-icon" data-lucide-icon="circle-dollar-sign" aria-hidden="true"></span>
+              <select id="display-currency" aria-label="Display currency" data-i18n-aria-label="ui.display_currency"></select>
+            </span>
+            <span id="auto-refresh-control" class="native-select auto-refresh-control hidden">
+              <span class="native-select-icon" data-lucide-icon="timer" aria-hidden="true"></span>
+              <select id="auto-refresh" aria-label="Auto refresh interval" data-i18n-aria-label="ui.auto_refresh_interval"></select>
+            </span>
+            <button id="request-event-columns" class="labeled-icon-button hidden" type="button" aria-haspopup="dialog" data-i18n="ui.columns">Columns</button>
+            <button id="events-export" class="labeled-icon-button hidden" type="button" data-i18n="ui.export">Export</button>
           </div>
         </div>
         <div id="shared-time-backdrop" class="time-range-backdrop hidden"></div>
@@ -111,7 +120,7 @@
                   </label>
                   <button id="keys-import-labels" class="labeled-icon-button" type="button" data-i18n="ui.import_labels">Import labels</button>
                   <button id="keys-reset-all" class="labeled-icon-button">
-                    <span data-lucide-icon="party-popper" aria-hidden="true"></span>
+                    <span data-lucide-icon="rotate-cw-clock" aria-hidden="true"></span>
                     <span data-i18n="ui.reset_all_quotas">Reset all quotas</span>
                   </button>
                 </div>
@@ -139,6 +148,9 @@
                   <option value="independent" data-i18n="ui.independent_cycles">Per-key schedule</option>
                   <option value="unified" data-i18n="ui.shared_cycles">Shared schedule</option>
                 </select></span>
+              </label>
+              <label class="field"> <span data-i18n="ui.currency">Currency</span>
+                <span class="native-select"><select id="plan-currency"></select></span>
               </label>
             </div>
             <div class="row spread plan-windows-heading">
@@ -190,7 +202,7 @@
         <section id="tab-prices" class="hidden">
           <div class="card">
             <div class="row spread section-toolbar">
-              <h2 data-i18n="ui.model_pricing">Model pricing</h2>
+              <h2><span data-i18n="ui.model_pricing">Model pricing</span><span class="price-unit" data-i18n="ui.per_1m_tokens">per 1M tokens</span></h2>
               <div class="row section-actions">
                 <input id="price-filter" placeholder="Search models"  data-i18n-placeholder="ui.search_models"/>
                 <button id="price-reference-refresh" data-i18n="ui.update_references">Update references</button>
@@ -198,7 +210,7 @@
               </div>
             </div>
             <div id="prices-body"></div>
-            <p id="price-status" class="muted small price-footnote"></p>
+            <p id="price-status" class="muted small table-footnote"></p>
           </div>
         </section>
 
@@ -250,11 +262,17 @@
           <div class="card">
             <div class="row spread section-toolbar">
               <h2 data-i18n="ui.auth_files">Auth Files</h2>
-              <div class="row section-actions auth-filter-bar">
-                <label class="toggle-filter">
-                  <input id="auth-enabled-only" type="checkbox" role="switch" checked />
-                  <span data-i18n="ui.enabled_only">Enabled only</span>
-                </label>
+              <div class="row section-actions credential-filter-bar">
+                <div class="credential-filter-switches">
+                  <label class="toggle-filter">
+                    <input id="auth-enabled-only" type="checkbox" role="switch" checked />
+                    <span data-i18n="ui.enabled_only">Enabled only</span>
+                  </label>
+                  <label class="toggle-filter">
+                    <input id="auth-quota-estimate" type="checkbox" role="switch" />
+                    <span data-i18n="ui.quota_estimate">Quota estimate</span>
+                  </label>
+                </div>
                 <span class="native-select">
                   <select id="auth-provider" aria-label="Filter by auth file category" data-i18n-aria-label="ui.filter_by_auth_file_category">
                     <option value="" data-i18n="ui.all_categories">All categories</option>
@@ -269,7 +287,31 @@
                 <button id="auth-refresh-filtered" class="labeled-icon-button" type="button" data-i18n="ui.update_quotas">Refresh quota</button>
               </div>
             </div>
-            <div id="auth-files-body" class="auth-file-list"></div>
+            <div id="auth-files-body" class="credential-list"></div>
+          </div>
+        </section>
+
+        <section id="tab-ai-providers" class="hidden">
+          <div class="card">
+            <div class="row spread section-toolbar">
+              <h2 data-i18n="ui.ai_providers">AI Providers</h2>
+              <div class="row section-actions credential-filter-bar">
+                <div class="credential-filter-switches">
+                  <label class="toggle-filter">
+                    <input id="ai-provider-enabled-only" type="checkbox" role="switch" checked />
+                    <span data-i18n="ui.enabled_only">Enabled only</span>
+                  </label>
+                </div>
+                <span class="native-select">
+                  <select id="ai-provider-type" aria-label="Filter by provider type" data-i18n-aria-label="ui.filter_by_ai_provider_type">
+                    <option value="" data-i18n="ui.all_types">All types</option>
+                  </select>
+                </span>
+                <input id="ai-provider-search" type="search" placeholder="Search AI providers" autocomplete="off"  data-i18n-placeholder="ui.search_ai_providers"/>
+                <button id="ai-provider-query-balances" class="labeled-icon-button" type="button" data-i18n="ui.query_balance">Query balance</button>
+              </div>
+            </div>
+            <div id="ai-providers-body" class="credential-list"></div>
           </div>
         </section>
 
@@ -338,24 +380,31 @@
                 <button type="button" class="icon-action" data-page-action="refresh" aria-label="Refresh" data-i18n-aria-label="ui.refresh"></button>
               </div>
             </nav>
-            <div class="page-tab-actions hidden">
-              <div id="account-shared-time-filter" class="shared-time-filter hidden">
-                <div class="time-range-control">
-                  <button
-                    id="account-shared-time-trigger"
-                    class="time-range-trigger"
-                    type="button"
-                    aria-haspopup="dialog"
-                    aria-expanded="false"
-                  >
-                    <span class="time-range-icon" data-lucide-icon="clock" aria-hidden="true"></span>
-                    <span id="account-shared-time-label" data-i18n="ui.last_30_days">Last 30 days</span>
-                    <span class="time-range-chevron" data-lucide-icon="chevron-down" aria-hidden="true"></span>
-                  </button>
-                  <div id="account-shared-time-popover" class="time-range-popover hidden" role="dialog" aria-label="Select time range" data-i18n-aria-label="ui.select_time_range"></div>
-                </div>
+            <div id="account-page-tab-actions" class="page-tab-actions hidden">
+              <div id="account-shared-time-filter" class="time-range-control hidden">
+                <button
+                  id="account-shared-time-trigger"
+                  class="time-range-trigger"
+                  type="button"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                >
+                  <span class="time-range-icon" data-lucide-icon="clock" aria-hidden="true"></span>
+                  <span id="account-shared-time-label" data-i18n="ui.last_30_days">Last 30 days</span>
+                  <span class="time-range-chevron" data-lucide-icon="chevron-down" aria-hidden="true"></span>
+                </button>
+                <div id="account-shared-time-popover" class="time-range-popover hidden" role="dialog" aria-label="Select time range" data-i18n-aria-label="ui.select_time_range"></div>
               </div>
-              <button id="account-events-export" class="labeled-icon-button hidden" type="button" data-tip="Export" data-i18n-data-tip="ui.export" data-i18n="ui.export">Export</button>
+              <span id="account-display-currency-control" class="native-select display-currency-control hidden">
+                <span class="native-select-icon" data-lucide-icon="circle-dollar-sign" aria-hidden="true"></span>
+                <select id="account-display-currency" aria-label="Display currency" data-i18n-aria-label="ui.display_currency"></select>
+              </span>
+              <span id="account-auto-refresh-control" class="native-select auto-refresh-control hidden">
+                <span class="native-select-icon" data-lucide-icon="timer" aria-hidden="true"></span>
+                <select id="account-auto-refresh" aria-label="Auto refresh interval" data-i18n-aria-label="ui.auto_refresh_interval"></select>
+              </span>
+              <button id="account-request-event-columns" class="labeled-icon-button hidden" type="button" aria-haspopup="dialog" data-i18n="ui.columns">Columns</button>
+              <button id="account-events-export" class="labeled-icon-button hidden" type="button" data-i18n="ui.export">Export</button>
             </div>
           </div>
           <div id="account-shared-time-backdrop" class="time-range-backdrop hidden"></div>
@@ -424,11 +473,13 @@
             <div class="card">
               <div class="row spread section-toolbar">
                 <h2 data-i18n="ui.auth_files">Auth Files</h2>
-                <div class="row section-actions auth-filter-bar">
-                  <label class="toggle-filter">
-                    <input id="account-auth-enabled-only" type="checkbox" role="switch" checked />
-                    <span data-i18n="ui.enabled_only">Enabled only</span>
-                  </label>
+                <div class="row section-actions credential-filter-bar">
+                  <div class="credential-filter-switches">
+                    <label class="toggle-filter">
+                      <input id="account-auth-enabled-only" type="checkbox" role="switch" checked />
+                      <span data-i18n="ui.enabled_only">Enabled only</span>
+                    </label>
+                  </div>
                   <span class="native-select">
                     <select id="account-auth-provider" aria-label="Filter by auth file category" data-i18n-aria-label="ui.filter_by_auth_file_category">
                       <option value="" data-i18n="ui.all_categories">All categories</option>
@@ -443,7 +494,31 @@
                   <button id="account-auth-refresh-filtered" class="labeled-icon-button" type="button" data-i18n="ui.update_quotas">Refresh quota</button>
                 </div>
               </div>
-              <div id="account-auth-files-body" class="auth-file-list"></div>
+              <div id="account-auth-files-body" class="credential-list"></div>
+              <p class="muted small table-footnote" data-i18n="ui.auth_file_usage_scope">Requests, tokens and costs cover only the current API key, not the auth file’s total usage.</p>
+            </div>
+          </section>
+          <section id="account-tab-ai-providers" class="hidden">
+            <div class="card">
+              <div class="row spread section-toolbar">
+                <h2 data-i18n="ui.ai_providers">AI Providers</h2>
+                <div class="row section-actions credential-filter-bar">
+                  <div class="credential-filter-switches">
+                    <label class="toggle-filter">
+                      <input id="account-ai-provider-enabled-only" type="checkbox" role="switch" checked />
+                      <span data-i18n="ui.enabled_only">Enabled only</span>
+                    </label>
+                  </div>
+                  <span class="native-select">
+                    <select id="account-ai-provider-type" aria-label="Filter by provider type" data-i18n-aria-label="ui.filter_by_ai_provider_type">
+                      <option value="" data-i18n="ui.all_types">All types</option>
+                    </select>
+                  </span>
+                  <input id="account-ai-provider-search" type="search" placeholder="Search AI providers" autocomplete="off"  data-i18n-placeholder="ui.search_ai_providers"/>
+                </div>
+              </div>
+              <div id="account-ai-providers-body" class="credential-list"></div>
+              <p class="muted small table-footnote" data-i18n="ui.ai_provider_usage_scope">Usage covers only the current API key. Balances reflect the last admin query.</p>
             </div>
           </section>
         </section>
@@ -452,10 +527,11 @@
     <footer class="page-footer">
       <span>© 2026 <a href="https://github.com/haowang02/cpa-plugin-key-billing" target="_blank" rel="noopener noreferrer">CPA Key Billing</a></span>
       <span>&thinsp;·&thinsp;<a href="https://github.com/haowang02/cpa-plugin-key-billing/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" data-i18n="ui.license">License</a></span>
-      <span>&thinsp;·&thinsp;<span data-i18n="ui.version">Version</span>: v1.3.20</span>
+      <span>&thinsp;·&thinsp;<span data-i18n="ui.version">Version</span>: v1.4.13</span>
     </footer>
 
     <div id="notice" class="notice" popover="manual"></div>
+    <div id="hover-tooltip" class="hover-tooltip" popover="manual" role="tooltip" tabindex="0"></div>
 
     <dialog id="price-dialog" class="settings-dialog">
       <h2 id="price-dialog-title" data-i18n="ui.edit_model_pricing">Edit model pricing</h2>
@@ -466,6 +542,10 @@
         <div id="price-reference-results" class="price-reference-results" aria-live="polite"></div>
       </div>
       <div class="price-fields">
+        <label class="field"> <span data-i18n="ui.currency">Currency</span>
+          <span class="native-select"><select id="price-currency"></select></span>
+        </label>
+        <span></span>
         <label class="field"> <span data-i18n="ui.input_1m_tokens">Input&thinsp;/&thinsp;1M tokens</span> <input id="price-in" type="number" step="any" min="0" value="0" /> </label>
         <label class="field"> <span data-i18n="ui.output_1m_tokens">Output&thinsp;/&thinsp;1M tokens</span> <input id="price-out" type="number" step="any" min="0" value="0" /> </label>
         <label class="field"> <span data-i18n="ui.cache_read_1m_tokens">Cache read&thinsp;/&thinsp;1M tokens</span> <input id="price-cr" type="number" step="any" min="0" /> </label>
@@ -491,11 +571,79 @@
       <div class="row dialog-actions"> <button id="action-cancel" data-i18n="ui.cancel">Cancel</button> <button id="action-confirm" class="primary" data-i18n="ui.confirm">Confirm</button> </div>
     </dialog>
 
-    <div id="hover-tooltip" class="hover-tooltip" popover="manual" role="tooltip" tabindex="0"></div>
+    <dialog id="request-event-columns-dialog" class="settings-dialog list-dialog column-settings-dialog" aria-labelledby="request-event-columns-title" aria-describedby="request-event-columns-hint">
+      <h2 id="request-event-columns-title" data-i18n="ui.columns">Columns</h2>
+      <p id="request-event-columns-hint" data-i18n="ui.request_event_columns_hint">Choose the columns to show and drag them to reorder the table.</p>
+      <div class="editor-state notice hidden"></div>
+      <div id="request-event-columns-list" class="column-settings"></div>
+      <p id="request-event-columns-status" class="visually-hidden" aria-live="polite"></p>
+      <div class="row dialog-actions">
+        <button id="request-event-columns-reset" class="link" data-i18n="ui.reset">Reset</button>
+        <button id="request-event-columns-cancel" data-i18n="ui.cancel">Cancel</button>
+        <button id="request-event-columns-save" class="primary" data-i18n="ui.save">Save</button>
+      </div>
+    </dialog>
 
-    <dialog id="route-picker" class="settings-dialog route-picker" aria-labelledby="route-picker-title" aria-describedby="route-picker-identity">
+    <dialog id="credential-dialog" aria-labelledby="credential-dialog-title">
+      <h2 id="credential-dialog-title"></h2>
+      <div class="editor-state notice hidden"></div>
+      <label class="field"><span data-i18n="ui.label">Label</span><input id="credential-note" type="text" autocomplete="off" placeholder="Leave empty to clear the label" data-i18n-placeholder="ui.clear_label_placeholder" /></label>
+      <div class="credential-editor-fields">
+        <div class="credential-editor-control">
+          <label class="field">
+            <span id="credential-priority-label" data-i18n="ui.priority">Priority</span>
+            <input id="credential-priority" type="number" step="1" aria-labelledby="credential-priority-label" aria-describedby="credential-priority-hint credential-editor-hint" />
+            <span id="credential-priority-hint" class="credential-field-hint" data-i18n="ui.priority_summary">Higher values have higher priority.</span>
+          </label>
+          <button id="credential-priority-info" type="button" class="inline-icon-button link credential-field-info" aria-label="Priority help" data-i18n-aria-label="ui.priority_help"></button>
+          <p id="credential-editor-hint" class="credential-field-hint hidden"></p>
+        </div>
+        <div class="credential-editor-control">
+          <label class="field">
+            <span id="credential-weight-label" data-i18n="ui.weight">Scheduling weight</span>
+            <input id="credential-weight" type="number" step="1" max="1000000" aria-labelledby="credential-weight-label" aria-describedby="credential-weight-hint" />
+            <span id="credential-weight-hint" class="credential-field-hint" data-i18n="ui.weight_summary">Takes effect when weighted round robin is enabled.</span>
+          </label>
+          <button id="credential-weight-info" type="button" class="inline-icon-button link credential-field-info" aria-label="Scheduling weight help" data-i18n-aria-label="ui.weight_help"></button>
+        </div>
+      </div>
+      <div class="row dialog-actions">
+        <button type="button" data-i18n="ui.cancel">Cancel</button>
+        <button id="credential-save" type="button" class="primary" data-i18n="ui.save">Save</button>
+      </div>
+    </dialog>
+
+    <div id="batch-bar" class="batch-bar hidden" role="region" aria-label="Batch actions" data-i18n-aria-label="ui.batch_actions"></div>
+
+    <dialog id="auth-drawer" class="drawer" aria-labelledby="auth-drawer-title">
+      <header class="drawer-header">
+        <div id="auth-drawer-identity" class="drawer-identity"></div>
+        <button id="auth-drawer-close" type="button" class="labeled-icon-button round-icon-button" aria-label="Close" data-i18n-aria-label="ui.close"></button>
+      </header>
+      <div class="drawer-body">
+        <section class="drawer-section" aria-labelledby="auth-drawer-usage-title">
+          <h3 id="auth-drawer-usage-title" data-i18n="ui.last_30_days_usage">Usage in the last 30 days</h3>
+          <div id="auth-drawer-usage"></div>
+          <div id="auth-drawer-models" class="table-scroll inset-card drawer-table"></div>
+        </section>
+        <section id="auth-drawer-reset-section" class="drawer-section" aria-labelledby="auth-drawer-reset-title">
+          <div class="drawer-section-head">
+            <h3 id="auth-drawer-reset-title"><span data-i18n="ui.manual_resets">Manual resets</span><span id="auth-drawer-reset-count" class="auth-reset-count-badge"></span></h3>
+            <button id="auth-drawer-reset" type="button" class="labeled-icon-button"></button>
+          </div>
+          <div id="auth-drawer-resets"></div>
+        </section>
+        <section class="drawer-section" aria-labelledby="auth-drawer-windows-title">
+          <h3 id="auth-drawer-windows-title" data-i18n="ui.quota_windows">Quota windows</h3>
+          <div id="auth-drawer-window-switch" class="segmented-control" role="tablist" aria-labelledby="auth-drawer-windows-title"></div>
+          <div id="auth-drawer-periods" role="tabpanel" aria-labelledby="auth-drawer-windows-title"></div>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="route-picker" class="settings-dialog list-dialog route-picker" aria-labelledby="route-picker-title" aria-describedby="route-picker-identity">
       <h2 id="route-picker-title" data-i18n="ui.edit_api_key_routing_rules">Edit API key routing rules</h2>
-      <p id="route-picker-identity" class="route-picker-identity mask-blur"></p>
+      <p id="route-picker-identity" class="mask-blur"></p>
       <div id="route-picker-notice" class="editor-state notice hidden"></div>
       <div class="route-form-toolbar">
         <input id="route-picker-search" type="search" placeholder="Search routing rules, upstream credentials, or models" aria-label="Search routing rules, upstream credentials, or models" autocomplete="off"  data-i18n-placeholder="ui.search_routing_rules_upstream_credentials_or_models" data-i18n-aria-label="ui.search_routing_rules_upstream_credentials_or_models"/>
@@ -518,17 +666,27 @@
       /*core.js*/
       /*format.js*/
       /*components.js*/
+      /*sortable.js*/
       /*data.js*/
       /*time-range.js*/
+      /*model-usage.js*/
       /*credentials.js*/
+      /*credential-editor.js*/
+      /*table-selection.js*/
       /*keys.js*/
       /*routing.js*/
       /*plans.js*/
       /*prices.js*/
       /*analysis.js*/
       /*events.js*/
+      /*request-events.js*/
+      /*error-events.js*/
       /*logs.js*/
       /*auth-files.js*/
+      /*auth-drawer.js*/
+      /*ai-provider-config.js*/
+      /*ai-balances.js*/
+      /*ai-providers.js*/
       /*account.js*/
       /*app.js*/
     </script>

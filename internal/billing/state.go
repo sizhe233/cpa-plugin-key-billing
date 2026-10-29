@@ -14,12 +14,6 @@ type State struct {
 	ConfigCredentials map[string]ConfigCredential
 }
 
-type ConfigCredential struct {
-	Provider   string
-	KeyPreview string
-	Disabled   bool
-}
-
 func NewState() *State {
 	return &State{
 		Prices:            make(map[string]CustomPrice),

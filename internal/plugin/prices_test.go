@@ -1,14 +1,43 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"cpa-key-billing/internal/billing"
 )
+
+func TestDownloadErrorsPreserveCauseWithoutURLSecrets(t *testing.T) {
+	app := NewApp()
+	t.Cleanup(app.Shutdown)
+	app.SetHostCaller(func(method string, _ any) (json.RawMessage, error) {
+		if method == hostAuthModels {
+			return json.RawMessage(`{"credentials":[]}`), nil
+		}
+		if method != hostHTTPDo {
+			t.Fatalf("unexpected host call %s", method)
+		}
+		return nil, &url.Error{Op: "Get", URL: "https://dummy:dummy-password@example.invalid/?key=dummy-secret", Err: context.DeadlineExceeded}
+	})
+	if _, err := app.HandleMethod(MethodPluginRegister, mustMarshal(t, LifecycleRequest{
+		ConfigYAML: testConfigYAML(t, true),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store.RefreshReferencePrices(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	message := app.store.ReferencePriceMetadata().LastError
+	if !strings.Contains(message, "context deadline exceeded") || strings.Contains(message, "dummy-") {
+		t.Fatalf("failure metadata lost diagnostics or disclosed URL: %s", message)
+	}
+}
 
 func TestPriceAdmissionAndDeleteWithoutInventory(t *testing.T) {
 	app := newConfiguredApp(t)
@@ -49,6 +78,17 @@ func TestPriceAdmissionAndDeleteWithoutInventory(t *testing.T) {
 		}
 	}
 	callOK(t, app, http.MethodPut, routePrices, nil, billing.CustomPrice{ModelID: "gpt-*"}, 200, nil)
+
+	raw, err := app.HandleMethod(MethodPluginReconfigure, mustMarshal(t, LifecycleRequest{
+		ConfigYAML: append(testConfigYAML(t, true), "allow_unpriced_models: true\n"...),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeResult(t, raw, nil)
+	if result := intercept("openai", "unpriced-dummy"); result.Terminate {
+		t.Fatal("allowed unpriced model was refused", result)
+	}
 }
 
 func TestBuiltinPriceAdmissionAndListing(t *testing.T) {
@@ -57,7 +97,7 @@ func TestBuiltinPriceAdmissionAndListing(t *testing.T) {
 		model      string
 		input, out float64
 	}{
-		{model: "codex-auto-review", input: 0.2, out: 1.2},
+		{model: "codex-auto-review", input: 0, out: 0},
 		{model: "gpt-image-1.5", input: 5, out: 32},
 	} {
 		price, model, err := app.store.ResolveModelPrice(test.model, test.model, true)
@@ -109,7 +149,7 @@ func TestUsageAfterPriceDeletionKeepsTokensAndZeroCost(t *testing.T) {
 			}
 			event := events[0]
 			if event.Failed != failed || event.PriceSource != billing.PriceSourceNone ||
-				event.Cost.TotalUSD != 0 || event.Cost.UncachedInputTokens != 100 ||
+				event.Cost.Total != 0 || event.Cost.UncachedInputTokens != 100 ||
 				event.Cost.BilledOutputTokens != 25 {
 				t.Fatalf("unpriced usage was not retained at zero cost: %+v", event)
 			}
@@ -163,7 +203,7 @@ func TestReferencePriceAdmissionAndUsageWithoutCustomPrices(t *testing.T) {
 			RequestedAt: app.store.Now(), Detail: UsageDetail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120},
 		})
 		entries := requestEventEntries(t, app)
-		if len(entries) != i+1 || entries[0].PriceSource != billing.PriceSourceReference || entries[0].Cost.TotalUSD <= 0 {
+		if len(entries) != i+1 || entries[0].PriceSource != billing.PriceSourceReference || entries[0].Cost.Total <= 0 {
 			t.Fatalf("reference usage not billed: %+v", entries)
 		}
 	}
@@ -211,7 +251,7 @@ func TestCustomPriceIdentityAcrossListingAdmissionAndUsage(t *testing.T) {
 			if len(events) != 1 || events[0].BillingModel != test.billingID || events[0].PriceSource != test.wantSource || events[0].Cost.AppliedInputPer1M != test.wantRate {
 				t.Fatalf("usage price = %+v", events)
 			}
-			assertCostClose(t, events[0].Cost.TotalUSD, test.wantRate/1000)
+			assertCostClose(t, events[0].Cost.Total, test.wantRate/1000)
 		})
 	}
 }

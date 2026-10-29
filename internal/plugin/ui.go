@@ -34,10 +34,7 @@ func buildUI() []byte {
 		}
 		catalogs[language] = entries
 	}
-	data, err := json.Marshal(catalogs)
-	if err != nil {
-		panic(err)
-	}
+	data, _ := json.Marshal(catalogs)
 	return uiInclude.ReplaceAllFunc(read("ui.html"), func(marker []byte) []byte {
 		name := string(uiInclude.FindSubmatch(marker)[1])
 		if name != "i18n.js" {

@@ -1,12 +1,9 @@
 package plugin
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,12 +22,13 @@ func exhaustedApp(t *testing.T, resetAfter time.Duration) *App {
 		t.Fatalf("SyncKeys error = %v", errSync)
 	}
 	if _, errCreate := app.store.CreatePlanWithBindings(billing.Plan{
-		ID: "plan-5", Name: "Plan 5", Windows: []billing.QuotaWindow{{Name: "额度", AmountUSD: 5, PeriodSeconds: int64(resetAfter / time.Second)}},
+		ID: "plan-5", Name: "Plan 5", Windows: []billing.QuotaWindow{{Name: "额度", Amount: 5, PeriodSeconds: int64(resetAfter / time.Second)}},
 	}, []string{billing.CallerScope(testAPIKey)}); errCreate != nil {
 		t.Fatalf("CreatePlanWithBindings error = %v", errCreate)
 	}
-	admit(t, app, "openai", "/v1/chat/completions")
+	requestID := admit(t, app, "openai", "/v1/chat/completions")
 	billUsage(t, app, 0, 0, 0, 2_500_000, 0)
+	completeRequest(t, app, requestID)
 	return app
 }
 
@@ -95,115 +93,6 @@ func TestInterceptUsesTheClientErrorShape(t *testing.T) {
 	}
 }
 
-func TestCompletionDuringReferencePriceRefresh(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		complete bool
-		generate bool
-		fail     bool
-	}{
-		{name: "completed generation", complete: true, generate: true},
-		{name: "completed non-generation", complete: true},
-		{name: "completed failed refresh", complete: true, generate: true, fail: true},
-		{name: "active generation", generate: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			prices, err := os.ReadFile("../billing/testdata/models_dev_prices.json")
-			if err != nil {
-				t.Fatal(err)
-			}
-			entered := make(chan struct{})
-			release := make(chan struct{})
-			var releaseOnce sync.Once
-			releaseDownload := func() { releaseOnce.Do(func() { close(release) }) }
-			app := newApp(billing.NewStore(openRepository, func(ctx context.Context) ([]byte, error) {
-				close(entered)
-				select {
-				case <-release:
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-				if test.fail {
-					return nil, fmt.Errorf("download failed")
-				}
-				return prices, nil
-			}))
-			t.Cleanup(app.Shutdown)
-			defer releaseDownload()
-			cfg := billing.DefaultConfig()
-			cfg.Enabled = true
-			cfg.StateFile = filepath.Join(t.TempDir(), "state.db")
-			// Leave startup reference loading pending to exercise the admission fetch.
-			if err := app.store.Configure(cfg); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := app.store.SyncKeys([]string{testAPIKey}, false); err != nil {
-				t.Fatal(err)
-			}
-			if err := app.store.SetConcurrencyLimit(flowScope(), 1); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := app.store.CreatePlanWithBindings(billing.Plan{
-				ID: "cancel-test", Name: "Cancel test", Windows: []billing.QuotaWindow{{Name: "额度", AmountUSD: 10, PeriodSeconds: 3600}},
-			}, []string{flowScope()}); err != nil {
-				t.Fatal(err)
-			}
-			request := mustMarshal(t, RequestInterceptRequest{
-				RequestID: "refresh-request", SourceFormat: "openai", Model: "gpt-4o", RequestedModel: "gpt-4o",
-				Metadata: map[string]any{MetadataCallerScope: flowScope(), MetadataGenerate: test.generate},
-			})
-			type result struct {
-				raw []byte
-				err error
-			}
-			done := make(chan result, 1)
-			go func() {
-				raw, err := app.HandleMethod(MethodRequestInterceptBefore, request)
-				done <- result{raw, err}
-			}()
-			select {
-			case <-entered:
-			case <-time.After(5 * time.Second):
-				t.Fatal("admission did not reach reference download")
-			}
-			if test.complete {
-				completeRequest(t, app, "refresh-request")
-				completeRequest(t, app, "refresh-request")
-			}
-			releaseDownload()
-			var response RequestInterceptResponse
-			select {
-			case result := <-done:
-				if result.err != nil {
-					t.Fatal(result.err)
-				}
-				decodeResult(t, result.raw, &response)
-			case <-time.After(5 * time.Second):
-				t.Fatal("admission did not finish after reference download")
-			}
-			if response.Terminate != test.complete {
-				t.Fatalf("admission = %+v", response)
-			}
-			view, _ := app.store.KeyViewForScope(flowScope())
-			if test.complete {
-				if view.CurrentConcurrency != 0 || !view.Windows[0].EndAt.IsZero() {
-					t.Fatalf("completed request changed admission state: %+v", view)
-				}
-			} else if view.CurrentConcurrency != 1 || view.Windows[0].EndAt.IsZero() {
-				t.Fatalf("active request was not admitted: %+v", view)
-			}
-			if len(app.admissions) != 0 {
-				t.Fatalf("admission markers retained: %d", len(app.admissions))
-			}
-			completeRequest(t, app, "refresh-request")
-			view, _ = app.store.KeyViewForScope(flowScope())
-			if view.CurrentConcurrency != 0 {
-				t.Fatalf("completion leaked slot: %+v", view)
-			}
-		})
-	}
-}
-
 func TestInterceptEnforcesQuotaDimensionsAfterRestart(t *testing.T) {
 	app, path := newAppWithPriceAndState(t, true)
 	if _, err := app.store.SyncKeys([]string{testAPIKey}, false); err != nil {
@@ -245,5 +134,61 @@ func TestInterceptEnforcesQuotaDimensionsAfterRestart(t *testing.T) {
 	if response.StatusCode != 429 || !strings.Contains(string(response.ResponseBody), "tokens 1200 / 1000") ||
 		!strings.Contains(string(response.ResponseBody), "requests 2 / 1") {
 		t.Fatalf("restart did not preserve exhaustion: %+v", response)
+	}
+}
+
+func TestRequestOriginsRespectScopeAndCapacity(t *testing.T) {
+	app := newApp(nil)
+	var group sync.WaitGroup
+	for worker := range 8 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := worker; i < maxRequestOrigins; i += 8 {
+				trace, endpoint := fmt.Sprint(i), fmt.Sprintf("/endpoint/%d", i)
+				app.rememberRequestOrigin(RequestInterceptRequest{TraceID: trace}, "scope", endpoint)
+				if got := app.findRequestOrigin(trace, "scope"); got.Endpoint != endpoint {
+					t.Errorf("concurrent origin crossed traces: %+v", got)
+				}
+			}
+		}()
+	}
+	group.Wait()
+	keep := app.requestOriginOrder.Back().Value.(*requestOrigin).key
+	app.findRequestOrigin(keep.traceID, keep.scope)
+	evicted := app.requestOriginOrder.Back().Value.(*requestOrigin).key
+	app.rememberRequestOrigin(RequestInterceptRequest{TraceID: "new-trace"}, "scope", "/v1/messages")
+	if len(app.requestOrigins) != maxRequestOrigins || app.findRequestOrigin(evicted.traceID, evicted.scope).Endpoint != "" ||
+		app.findRequestOrigin(keep.traceID, keep.scope).Endpoint == "" {
+		t.Fatal("origin retention did not evict the least recently used trace")
+	}
+
+	for _, test := range []struct {
+		scope, path string
+		headers     http.Header
+	}{
+		{"scope-a", "/v1/responses", http.Header{"User-Agent": {strings.Repeat("a", maxClientHeaderBytes+1)}}},
+		{"scope-b", "/v1/messages?key=dummy-secret", http.Header{
+			"User-Agent": {" dummy-client/1.0 "}, "X-Forwarded-For": {"192.0.2.10", "198.51.100.20"},
+		}},
+	} {
+		app.rememberRequestOrigin(RequestInterceptRequest{TraceID: "shared", Headers: test.headers}, test.scope, test.path)
+	}
+	if got := app.findRequestOrigin("shared", "scope-b"); got != (billing.RequestOrigin{
+		Endpoint: "/v1/messages", Transport: "http", UserAgent: "dummy-client/1.0", XForwardedFor: "192.0.2.10, 198.51.100.20",
+	}) {
+		t.Fatalf("incorrect scoped origin: %+v", got)
+	}
+	if got := app.findRequestOrigin("shared", "scope-a"); got != (billing.RequestOrigin{Endpoint: "/v1/responses", Transport: "http"}) {
+		t.Fatalf("origin crossed caller scopes or kept an oversized header: %+v", got)
+	}
+	for _, endpoint := range []string{"/v1/messages", "/v1/responses"} {
+		app.rememberRequestOrigin(RequestInterceptRequest{TraceID: "shared"}, "scope-a", endpoint)
+		if got := app.findRequestOrigin("shared", "scope-a"); got != (billing.RequestOrigin{}) {
+			t.Fatalf("conflicting trace ID was guessed: %+v", got)
+		}
+	}
+	if got := app.findRequestOrigin("missing", "scope-a"); got != (billing.RequestOrigin{}) {
+		t.Fatalf("missing trace ID was guessed: %+v", got)
 	}
 }

@@ -25,9 +25,10 @@ type accountConcurrency struct {
 }
 
 type accountProfileResponse struct {
-	Tracked           bool            `json:"tracked"`
-	Identity          accountIdentity `json:"identity"`
-	CanResetAuthQuota bool            `json:"can_reset_auth_quota"`
+	Tracked              bool            `json:"tracked"`
+	Identity             accountIdentity `json:"identity"`
+	CanResetAuthQuota    bool            `json:"can_reset_auth_quota"`
+	CanUseUnpricedModels bool            `json:"can_use_unpriced_models"`
 }
 
 type accountSubscriptionResponse struct {
@@ -40,7 +41,7 @@ type accountRoutingResponse struct {
 	Credentials       []accountRouteCredential `json:"credentials"`
 	DeniedModels      []string                 `json:"denied_models"`
 	DeniedCredentials []accountRouteCredential `json:"denied_credentials"`
-	RoutingValid      bool                     `json:"routing_valid"`
+	CatalogFiltered   bool                     `json:"catalog_filtered"`
 	Warnings          []string                 `json:"warnings"`
 	WarningMessages   []messages.Message       `json:"warning_messages,omitempty"`
 }
@@ -49,6 +50,7 @@ type accountRouteCredential struct {
 	Denied       bool             `json:"denied,omitempty"`
 	Source       string           `json:"source,omitempty"`
 	Provider     string           `json:"provider,omitempty"`
+	ProviderName string           `json:"provider_name,omitempty"`
 	Name         string           `json:"name,omitempty"`
 	NameMessage  messages.Message `json:"name_message,omitzero"`
 	Status       string           `json:"status,omitempty"`
@@ -58,8 +60,10 @@ type accountRouteCredential struct {
 func (a *App) accountProfile(access viewAccess) ManagementResponse {
 	response := accountProfileResponse{Tracked: access.Tracked}
 	if access.Tracked {
+		cfg := a.store.Config()
 		response.Identity = accountIdentity{Preview: access.Key.Preview, Label: access.Key.Label}
-		response.CanResetAuthQuota = a.store.AllowAPIKeyQuotaReset()
+		response.CanResetAuthQuota = cfg.AllowAPIKeyQuotaReset
+		response.CanUseUnpricedModels = cfg.AllowUnpricedModels
 	}
 	return viewJSON(access, http.StatusOK, response)
 }
@@ -83,11 +87,7 @@ func (a *App) accountRouting(access viewAccess) ManagementResponse {
 	response := accountRoutingResponse{
 		Models: decision.Models, DeniedModels: decision.DeniedModels,
 		Credentials: []accountRouteCredential{}, DeniedCredentials: []accountRouteCredential{},
-		RoutingValid: decision.ConfigurationError == "", Warnings: []string{},
-	}
-	if decision.ConfigurationError != "" {
-		response.Warnings = append(response.Warnings, "The routing rule no longer exists; contact your administrator")
-		response.WarningMessages = append(response.WarningMessages, messages.New("The routing rule no longer exists; contact your administrator"))
+		CatalogFiltered: a.filtersModelCatalogs(), Warnings: []string{},
 	}
 	if !decision.RestrictsCredentials() {
 		return viewJSON(access, http.StatusOK, response)
@@ -182,7 +182,8 @@ func accountCredential(item credentialView) accountRouteCredential {
 	if status == "" {
 		status = "active"
 	}
-	return accountRouteCredential{Source: item.Source, Provider: item.Provider, Name: item.DisplayName, NameMessage: item.DisplayMessage, Status: status}
+	return accountRouteCredential{Source: item.Source, Provider: item.Provider, ProviderName: item.ProviderName,
+		Name: item.DisplayName, NameMessage: item.DisplayMessage, Status: status}
 }
 func accountScope(headers http.Header) (string, bool) {
 	values := headers.Values("Authorization")

@@ -12,14 +12,7 @@ import (
 )
 
 func appendRequestEvent(tx *sql.Tx, entry billing.RequestEvent) (int64, error) {
-	headers := "{}"
-	if len(entry.QuotaHeaders) > 0 {
-		raw, err := json.Marshal(entry.QuotaHeaders)
-		if err != nil {
-			return 0, fmt.Errorf("Encode quota headers: %w", err)
-		}
-		headers = string(raw)
-	}
+	execution, _ := json.Marshal(entry.Execution)
 	// Only persistence encodes the multiplier into the price source.
 	priceSource := string(entry.PriceSource)
 	switch entry.PriceSource {
@@ -33,29 +26,36 @@ func appendRequestEvent(tx *sql.Tx, entry billing.RequestEvent) (int64, error) {
 			at, scope, auth_index, provider, account, executor_type, reasoning_effort, service_tier,
 			response_service_tier, upstream_model, response_model, billing_model, failed, latency_ms, ttft_ms,
 			accounting_quality, price_source, reasoning_tokens,
-			total_usd, uncached_input_usd, cache_read_usd, cache_write_usd, output_usd,
+			currency, total_cost, uncached_input_cost, cache_read_cost, cache_write_cost, output_cost,
 			uncached_input_tokens, cache_read_tokens, cache_write_tokens, billed_output_tokens,
 			tiered, long_context, threshold_input_tokens,
 			applied_input_per_1m, applied_output_per_1m,
-			applied_cache_read_per_1m, applied_cache_write_per_1m, response_headers_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			applied_cache_read_per_1m, applied_cache_write_per_1m,
+			endpoint, transport, stream, execution_json, user_agent, x_forwarded_for
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nanos(entry.At), entry.Scope, entry.AuthIndex, entry.Provider, entry.Account, entry.ExecutorType, entry.ReasoningEffort, entry.ServiceTier,
 		entry.ResponseServiceTier, entry.UpstreamModel, entry.ResponseModel, entry.BillingModel, entry.Failed,
 		entry.LatencyMS, entry.TTFTMS,
 		string(entry.AccountingQuality), priceSource, entry.ReasoningTokens,
-		entry.Cost.TotalUSD, entry.Cost.UncachedInputUSD, entry.Cost.CacheReadUSD,
-		entry.Cost.CacheWriteUSD, entry.Cost.OutputUSD,
+		string(entry.Cost.Currency), entry.Cost.Total, entry.Cost.UncachedInput, entry.Cost.CacheRead,
+		entry.Cost.CacheWrite, entry.Cost.Output,
 		entry.Cost.UncachedInputTokens, entry.Cost.CacheReadTokens,
 		entry.Cost.CacheWriteTokens, entry.Cost.BilledOutputTokens,
 		entry.Cost.Tiered, entry.Cost.LongContext, entry.Cost.ThresholdInputTokens,
 		entry.Cost.AppliedInputPer1M, entry.Cost.AppliedOutputPer1M,
-		entry.Cost.AppliedCacheReadPer1M, entry.Cost.AppliedCacheWritePer1M, headers)
+		entry.Cost.AppliedCacheReadPer1M, entry.Cost.AppliedCacheWritePer1M,
+		entry.Endpoint, entry.Transport, entry.Stream, string(execution), entry.UserAgent, entry.XForwardedFor)
 	if errInsert != nil {
 		return 0, fmt.Errorf("Write request event: %w", errInsert)
 	}
 	id, errID := result.LastInsertId()
 	if errID != nil {
 		return 0, fmt.Errorf("Read request event ID: %w", errID)
+	}
+	if entry.Quota != nil {
+		if err := insertQuotaReport(tx, id, entry.AuthIndex, entry.At, *entry.Quota); err != nil {
+			return 0, err
+		}
 	}
 	return id, nil
 }
@@ -81,14 +81,17 @@ func pruneRequestEvents(exec execer, cutoff time.Time) error {
 // Model filters and their expression index must use the same expression.
 const eventModelSQL = "coalesce(NULLIF(billing_model, ''), upstream_model)"
 
-const requestEventProviderName = `CASE WHEN substr(r.provider, 1, 18) = 'openai-compatible-'
-	THEN substr(r.provider, 19) ELSE r.provider END`
+// A configured credential is named as configured; any other credential, or one
+// since removed, by the provider that served it.
+var requestEventSourceName = `coalesce((SELECT ` + sourceNameSQL("c.name") + `
+	FROM config_credentials c WHERE r.auth_index != '' AND c.auth_index = r.auth_index AND c.name != ''),
+	` + sourceNameSQL(`(CASE WHEN substr(r.provider, 1, 18) = 'openai-compatible-' THEN substr(r.provider, 19) ELSE r.provider END)`) + `)`
 
-const requestEventSourceName = `CASE
-	WHEN (` + requestEventProviderName + `) = '' THEN r.account
-	WHEN r.account = '' OR lower(r.account) = lower(` + requestEventProviderName + `)
-		THEN (` + requestEventProviderName + `)
-	ELSE (` + requestEventProviderName + `) || ' · ' || r.account END`
+func sourceNameSQL(providerName string) string {
+	return `CASE WHEN ` + providerName + ` = '' THEN r.account
+		WHEN r.account = '' OR lower(r.account) = lower(` + providerName + `) THEN ` + providerName + `
+		ELSE ` + providerName + ` || ' · ' || r.account END`
+}
 
 const requestEventSource = `
 	FROM request_events r
@@ -143,13 +146,13 @@ func (d *DB) RequestEvents(query billing.RequestEventQuery, since time.Time) (bi
 			r.executor_type, r.reasoning_effort, r.service_tier, r.response_service_tier,
 			r.upstream_model, r.response_model, r.billing_model, r.failed, r.latency_ms, r.ttft_ms,
 			r.accounting_quality, r.price_source, r.reasoning_tokens,
-			r.total_usd, r.uncached_input_usd, r.cache_read_usd, r.cache_write_usd, r.output_usd,
+			r.currency, r.total_cost, r.uncached_input_cost, r.cache_read_cost, r.cache_write_cost, r.output_cost,
 			r.uncached_input_tokens, r.cache_read_tokens, r.cache_write_tokens, r.billed_output_tokens,
 			r.tiered, r.long_context, r.threshold_input_tokens,
 			r.applied_input_per_1m, r.applied_output_per_1m,
 			r.applied_cache_read_per_1m, r.applied_cache_write_per_1m,
 			coalesce(k.preview, ''), coalesce(k.label, ''), `+requestEventSourceName+`,
-			coalesce(e.body, '')
+			coalesce(e.body, ''), r.endpoint, r.transport, r.stream, r.execution_json, r.user_agent, r.x_forwarded_for
 		FROM page JOIN request_events r ON r.id = page.id
 		LEFT JOIN api_keys k ON k.scope = r.scope
 		LEFT JOIN request_errors e ON e.request_event_id = r.id
@@ -258,21 +261,26 @@ func scanRequestEventRow(rows *sql.Rows) (billing.RequestEventRow, error) {
 		row                  billing.RequestEventRow
 		at, failed           int64
 		quality, priceSource string
+		execution            string
 	)
 	if errScan := rows.Scan(&row.ID, &at, &row.Scope, &row.AuthIndex, &row.Provider, &row.Account,
 		&row.ExecutorType, &row.ReasoningEffort, &row.ServiceTier, &row.ResponseServiceTier,
 		&row.UpstreamModel, &row.ResponseModel, &row.BillingModel, &failed,
 		&row.LatencyMS, &row.TTFTMS,
 		&quality, &priceSource, &row.ReasoningTokens,
-		&row.Cost.TotalUSD, &row.Cost.UncachedInputUSD, &row.Cost.CacheReadUSD,
-		&row.Cost.CacheWriteUSD, &row.Cost.OutputUSD,
+		&row.Cost.Currency, &row.Cost.Total, &row.Cost.UncachedInput, &row.Cost.CacheRead,
+		&row.Cost.CacheWrite, &row.Cost.Output,
 		&row.Cost.UncachedInputTokens, &row.Cost.CacheReadTokens,
 		&row.Cost.CacheWriteTokens, &row.Cost.BilledOutputTokens,
 		&row.Cost.Tiered, &row.Cost.LongContext, &row.Cost.ThresholdInputTokens,
 		&row.Cost.AppliedInputPer1M, &row.Cost.AppliedOutputPer1M,
 		&row.Cost.AppliedCacheReadPer1M, &row.Cost.AppliedCacheWritePer1M,
-		&row.Preview, &row.Label, &row.Source, &row.ErrorBody); errScan != nil {
+		&row.Preview, &row.Label, &row.Source, &row.ErrorBody, &row.Endpoint, &row.Transport, &row.Stream, &execution,
+		&row.UserAgent, &row.XForwardedFor); errScan != nil {
 		return billing.RequestEventRow{}, fmt.Errorf("Read request events: %w", errScan)
+	}
+	if err := json.Unmarshal([]byte(execution), &row.Execution); err != nil {
+		return billing.RequestEventRow{}, fmt.Errorf("Read execution metadata: %w", err)
 	}
 	row.At = timeAt(at)
 	row.Failed = failed != 0

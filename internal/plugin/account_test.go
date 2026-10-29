@@ -223,6 +223,42 @@ func TestAccountAnalysisCannotCrossScopesOrExposeScope(t *testing.T) {
 			t.Fatalf("account analysis leaked scope %q: %s", forbidden, body)
 		}
 	}
+	var breakdown struct{ Models []billing.ModelUsage }
+	response = callAccount(t, app, routeUsageModels, accountTestKeyA, url.Values{"dimension": {"models"}, "value": {"gpt-5.5"}})
+	if err := json.Unmarshal(response.Body, &breakdown); err != nil || len(breakdown.Models) != 1 || breakdown.Models[0].Requests != 1 {
+		t.Fatalf("model breakdown = %s", response.Body)
+	}
+	response = callAccount(t, app, routeUsageModels, accountTestKeyA, url.Values{"dimension": {"api_keys"}, "value": {billing.CallerScope(accountTestKeyB)}})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("account selected another key: status = %d", response.StatusCode)
+	}
+}
+
+func TestAccountAnalysisSpeedStaysInTheCallerScope(t *testing.T) {
+	app := newAppWithPrice(t, true)
+	if _, errSync := app.store.SyncKeys([]string{accountTestKeyA, accountTestKeyB}, false); errSync != nil {
+		t.Fatal(errSync)
+	}
+	for key, latency := range map[string]time.Duration{accountTestKeyA: time.Second, accountTestKeyB: 4 * time.Second} {
+		publishUsageRecord(t, app, UsageRecord{
+			Provider: "openai", ExecutorType: "OpenAICompatExecutor", Model: "gpt-5.5", Alias: "gpt-5.5",
+			APIKey: key, Generate: true, RequestedAt: app.store.Now(), Latency: latency,
+			Detail: UsageDetail{OutputTokens: 100, TotalTokens: 100},
+		})
+	}
+	response := callAccount(t, app, routeAnalysisSpeed, accountTestKeyA, url.Values{
+		"api_key": {billing.CallerScope(accountTestKeyB)}, "model": {"gpt-5.5"},
+	})
+	var view billing.AnalysisSpeedView
+	if err := json.Unmarshal(response.Body, &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Summary.Samples != 1 || view.Summary.P50 != 100 {
+		t.Fatalf("speed = %+v", view.Summary)
+	}
+	if response = callAccount(t, app, routeAnalysisSpeed, accountTestKeyA, nil); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("speed without a model status = %d, want 400", response.StatusCode)
+	}
 }
 
 func TestAccountRequestEventsUseTheAdministratorSource(t *testing.T) {
@@ -274,6 +310,7 @@ func TestAccountEmailMasking(t *testing.T) {
 	publishUsageRecord(t, app, UsageRecord{
 		Provider: "codex", Model: "gpt-5.5", Alias: "gpt-5.5", APIKey: accountTestKeyA,
 		AuthType: "oauth", Source: "private@example.com", Failed: true,
+		SessionID: "private@example.com", ParentSessionID: "parent@example.com",
 		Failure: UsageFailure{Body: `{"error":{"message":"contact private@example.com"}}`},
 	})
 	profile := callAccount(t, app, routeProfile, accountTestKeyA, nil)
@@ -289,6 +326,7 @@ func TestAccountEmailMasking(t *testing.T) {
 		t.Fatal(errDecode)
 	}
 	if len(view.Entries) != 1 || view.Entries[0].Source != "codex · pr****e@example.com" ||
+		view.Entries[0].Execution == nil || view.Entries[0].Execution.SessionID != "pr****e@example.com" || view.Entries[0].Execution.ParentSessionID != "pa***t@example.com" ||
 		view.Filters == nil || len(view.Filters.SourceOptions) != 1 ||
 		view.Filters.SourceOptions[0].Label != "codex · pr****e@example.com" {
 		t.Fatalf("masked event view = %+v", view)
@@ -352,7 +390,7 @@ func TestAccountRoutingAndPricesRespectItsScope(t *testing.T) {
 		access.Models[0] != "gpt-5.5" || access.Models[1] != "missing-model" {
 		t.Fatalf("route access = %+v", access)
 	}
-	if !access.RoutingValid || len(access.Credentials) != 1 || access.Credentials[0].Name != "user@example.com" {
+	if len(access.Credentials) != 1 || access.Credentials[0].Name != "user@example.com" {
 		t.Fatalf("credential access = %+v", access)
 	}
 	if strings.Contains(string(response.Body), `"bindings"`) || strings.Contains(string(response.Body), `"kind"`) {
@@ -371,7 +409,7 @@ func TestAccountRoutingAndPricesRespectItsScope(t *testing.T) {
 		if err := json.Unmarshal(response.Body, &access); err != nil {
 			t.Fatal(err)
 		}
-		if !access.RoutingValid || len(access.Models) != 0 || len(access.Credentials) != 0 || len(access.DeniedModels) != 1 || len(access.DeniedCredentials) != 2 || len(access.Warnings) != 0 {
+		if len(access.Models) != 0 || len(access.Credentials) != 0 || len(access.DeniedModels) != 1 || len(access.DeniedCredentials) != 2 || len(access.Warnings) != 0 {
 			t.Fatalf("blacklist-only account: %+v", access)
 		}
 		if strings.Contains(string(response.Body), "sha256:") || strings.Contains(string(response.Body), "dummy-denied") {

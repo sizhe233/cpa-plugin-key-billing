@@ -4,24 +4,24 @@ import "strings"
 
 const MaxConcurrencyLimit = 10000
 
+type concurrencySlot struct {
+	Scope         string
+	CredentialRef string
+}
+
 // SlotDecision reports the result of reserving one generation concurrency
 // slot. Active is the number of slots already occupied when a request is
 // refused, or the number occupied after a successful reservation.
 type SlotDecision struct {
-	Allowed  bool
-	Acquired bool
-	Limit    int
-	Active   int
+	Allowed bool
+	Limit   int
+	Active  int
 }
 
-// AcquireSlot atomically checks and reserves one API-key-scoped generation
-// slot. Every attributable generation is tracked even while its limit is zero,
-// so lowering an unlimited key to a finite limit immediately accounts for
-// requests that were already running.
+// Track unlimited keys too, so lowering a limit includes requests already running.
 func (s *Store) AcquireSlot(scope, requestID string) SlotDecision {
 	decision := SlotDecision{Allowed: true}
 	scope = strings.TrimSpace(scope)
-	requestID = strings.TrimSpace(requestID)
 	if scope == "" {
 		return decision
 	}
@@ -33,49 +33,54 @@ func (s *Store) AcquireSlot(scope, requestID string) SlotDecision {
 		decision.Limit = key.ConcurrencyLimit
 	}
 	decision.Active = s.activeByScope[scope]
-	if requestID == "" {
-		// A finite limit cannot be enforced safely without an exact completion
-		// correlation. Current compatible hosts always provide RequestID.
-		decision.Allowed = decision.Limit <= 0
-		return decision
-	}
-	if existingScope, exists := s.activeRequests[requestID]; exists {
-		decision.Allowed = existingScope == scope
-		// The original admission owns this reservation. Reporting a duplicate
-		// as newly acquired would let a later admission check roll it back.
-		decision.Acquired = false
-		return decision
-	}
 	if decision.Limit > 0 && decision.Active >= decision.Limit {
 		decision.Allowed = false
 		return decision
 	}
 
-	s.activeRequests[requestID] = scope
+	s.activeRequests[requestID] = concurrencySlot{Scope: scope}
 	s.activeByScope[scope] = decision.Active + 1
 	decision.Active++
-	decision.Acquired = true
 	return decision
 }
 
-// ReleaseSlot idempotently releases the slot reserved for requestID. Unknown
-// and duplicate completion events are harmless.
-func (s *Store) ReleaseSlot(requestID string) bool {
-	requestID = strings.TrimSpace(requestID)
-	if requestID == "" {
-		return false
-	}
+// Retries keep the request ID and replace its credential.
+func (s *Store) AssignSlotCredential(requestID, credentialRef string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	scope, exists := s.activeRequests[requestID]
+	slot, exists := s.activeRequests[requestID]
+	if !exists {
+		return
+	}
+	slot.CredentialRef = credentialRef
+	s.activeRequests[requestID] = slot
+}
+
+func (s *Store) CredentialConcurrency(scope string) map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	counts := make(map[string]int)
+	for _, slot := range s.activeRequests {
+		if slot.CredentialRef != "" && (scope == "" || slot.Scope == scope) {
+			counts[slot.CredentialRef]++
+		}
+	}
+	return counts
+}
+
+// Completion also covers requests that never acquired a slot.
+func (s *Store) ReleaseSlot(requestID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, exists := s.activeRequests[requestID]
 	if !exists {
 		return false
 	}
 	delete(s.activeRequests, requestID)
-	if active := s.activeByScope[scope]; active > 1 {
-		s.activeByScope[scope] = active - 1
+	if active := s.activeByScope[slot.Scope]; active > 1 {
+		s.activeByScope[slot.Scope] = active - 1
 	} else {
-		delete(s.activeByScope, scope)
+		delete(s.activeByScope, slot.Scope)
 	}
 	return true
 }

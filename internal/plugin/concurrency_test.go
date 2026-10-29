@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"cpa-key-billing/internal/billing"
 )
 
 func concurrencyApp(t *testing.T, limit int) *App {
@@ -22,7 +24,7 @@ func concurrencyApp(t *testing.T, limit int) *App {
 func interceptWithID(t *testing.T, app *App, requestID string, generate bool) RequestInterceptResponse {
 	t.Helper()
 	raw, errHandle := app.HandleMethod(MethodRequestInterceptBefore, mustMarshal(t, RequestInterceptRequest{
-		RequestID: requestID, SourceFormat: "openai", Model: flowModel, RequestedModel: flowModel,
+		RequestID: requestID, TraceID: requestID, SourceFormat: "openai", Model: flowModel, RequestedModel: flowModel,
 		Metadata: map[string]any{
 			MetadataCallerScope: flowScope(), MetadataRequestPath: "/v1/responses", MetadataGenerate: generate,
 		},
@@ -44,6 +46,22 @@ func completeRequest(t *testing.T, app *App, requestID string) {
 	decodeResult(t, raw, nil)
 }
 
+func selectRequestCredential(t *testing.T, app *App, requestID, credentialID string) {
+	t.Helper()
+	raw, err := app.HandleMethod(MethodRequestInterceptAfter, mustMarshal(t, RequestInterceptRequest{
+		RequestID: requestID, Model: flowModel, RequestedModel: flowModel,
+		Metadata: map[string]any{MetadataCallerScope: flowScope(), MetadataSelectedAuth: credentialID, MetadataSelectedIndex: "shared-index"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response RequestInterceptResponse
+	decodeResult(t, raw, &response)
+	if response.Terminate {
+		t.Fatalf("credential selection refused: %+v", response)
+	}
+}
+
 func TestConcurrencyLimitRejectsAndCompletionReleases(t *testing.T) {
 	app := concurrencyApp(t, 1)
 	if first := interceptWithID(t, app, "request-1", true); first.Terminate {
@@ -60,9 +78,18 @@ func TestConcurrencyLimitRejectsAndCompletionReleases(t *testing.T) {
 	if len(views) != 1 || views[0].CurrentConcurrency != 1 || views[0].ConcurrencyLimit != 1 {
 		t.Fatalf("key views = %+v", views)
 	}
+	for _, id := range []string{"credential-a", "credential-a", "credential-b"} {
+		selectRequestCredential(t, app, "request-1", id)
+		counts := app.store.CredentialConcurrency("")
+		if len(counts) != 1 || counts[billing.CredentialFingerprint(id)] != 1 {
+			t.Fatalf("credential concurrency after selection of %s = %v", id, counts)
+		}
+	}
 
 	completeRequest(t, app, "request-1")
-	completeRequest(t, app, "request-1")
+	if counts := app.store.CredentialConcurrency(""); len(counts) != 0 {
+		t.Fatalf("completion retained credential concurrency: %v", counts)
+	}
 	if retry := interceptWithID(t, app, "request-3", true); retry.Terminate {
 		t.Fatalf("retry response = %+v", retry)
 	}
@@ -72,6 +99,10 @@ func TestNonGeneratingRequestDoesNotOccupySlot(t *testing.T) {
 	app := concurrencyApp(t, 1)
 	if prewarm := interceptWithID(t, app, "prewarm", false); prewarm.Terminate {
 		t.Fatalf("prewarm response = %+v", prewarm)
+	}
+	selectRequestCredential(t, app, "prewarm", "credential-a")
+	if counts := app.store.CredentialConcurrency(""); len(counts) != 0 {
+		t.Fatalf("non-generating request occupied a credential: %v", counts)
 	}
 	if first := interceptWithID(t, app, "request-1", true); first.Terminate {
 		t.Fatalf("generation response = %+v", first)
@@ -92,16 +123,5 @@ func TestQuotaRejectionRollsBackConcurrencySlot(t *testing.T) {
 	}
 	if current := app.store.KeyViews()[0].CurrentConcurrency; current != 0 {
 		t.Fatalf("CurrentConcurrency = %d, want the refused request released", current)
-	}
-}
-
-func TestFiniteLimitRequiresRequestID(t *testing.T) {
-	app := concurrencyApp(t, 1)
-	response := interceptWithID(t, app, "", true)
-	if !response.Terminate || response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("response = %+v, want fail-closed admission without RequestID", response)
-	}
-	if current := app.store.KeyViews()[0].CurrentConcurrency; current != 0 {
-		t.Fatalf("CurrentConcurrency = %d, want no leaked slot", current)
 	}
 }

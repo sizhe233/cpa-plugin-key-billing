@@ -21,7 +21,7 @@ func TestReferencePricesSQLiteRestartHashAndAtomicFailure(t *testing.T) {
 	}
 	download := func(context.Context) ([]byte, error) { return raw, nil }
 	path := filepath.Join(t.TempDir(), "state.db")
-	open := func(path string) (billing.Repository, error) { return Open(path) }
+	open := func(path string) (billing.Repository, error) { return Open(path, nil) }
 	store := billing.NewStore(open, download)
 	defer store.Close()
 	cfg := billing.DefaultConfig()
@@ -33,7 +33,7 @@ func TestReferencePricesSQLiteRestartHashAndAtomicFailure(t *testing.T) {
 	if err != nil || !first.Usable {
 		t.Fatal(first, err)
 	}
-	database, err := Open(path)
+	database, err := Open(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestReferencePricesSQLiteRestartHashAndAtomicFailure(t *testing.T) {
 
 func BenchmarkReferencePricesPricing(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "reference-prices.db")
-	d, err := Open(path)
+	d, err := Open(path, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func BenchmarkReferencePricesPricing(b *testing.B) {
 	if err := d.SaveReferencePrices(context.Background(), billing.ReferencePriceMetadata{ContentHash: "benchmark", ModelCount: len(rules), Version: 1, FetchedAt: time.Now()}, rules); err != nil {
 		b.Fatal(err)
 	}
-	s := billing.NewStore(func(path string) (billing.Repository, error) { return Open(path) }, nil)
+	s := billing.NewStore(func(path string) (billing.Repository, error) { return Open(path, nil) }, nil)
 	defer s.Close()
 	cfg := billing.DefaultConfig()
 	cfg.StateFile = path
@@ -182,7 +182,7 @@ func BenchmarkReferencePricesRefresh(b *testing.B) {
 		}
 		return raw, nil
 	}
-	s := billing.NewStore(func(path string) (billing.Repository, error) { return Open(path) }, download)
+	s := billing.NewStore(func(path string) (billing.Repository, error) { return Open(path, nil) }, download)
 	defer s.Close()
 	cfg := billing.DefaultConfig()
 	cfg.StateFile = filepath.Join(b.TempDir(), "reference-prices.db")

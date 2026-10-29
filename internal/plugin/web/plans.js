@@ -1,13 +1,5 @@
 const QUOTA_DIMENSIONS = [
-  {
-    key: "amount_usd",
-    metric: "amount_usd",
-    label: m("ui.amount"),
-    inputLabel: m("quota.amount_limit"),
-    planValue: usd,
-    format: usd,
-    exact: usd
-  },
+  { key: "amount", metric: "amount", label: m("ui.amount"), inputLabel: m("quota.amount_limit"), planValue: money, format: money },
   {
     key: "token_limit",
     metric: "tokens",
@@ -23,8 +15,7 @@ const QUOTA_DIMENSIONS = [
     label: m("ui.requests"),
     inputLabel: m("quota.request_limit"),
     planValue: (value) => m("quota.request_count", { count: value, value: int(value) }),
-    format: int,
-    exact: int
+    format: int
   }
 ];
 const PERIOD_UNITS = [[86400, m("ui.days")], [3600, m("ui.hours")], [60, m("ui.minutes")], [1, m("ui.seconds")]];
@@ -43,8 +34,8 @@ function renderPlans() {
       const windows = plan.windows.map((window) => {
         const quotas = settingsChipList(
           QUOTA_DIMENSIONS.filter((metric) => window[metric.key] > 0).map((metric) => ({
-            text: metric.planValue(window[metric.key]),
-            hint: m("ui.metric_value", { v0: metric.label, v1: metric.exact(window[metric.key]) })
+            text: metric.planValue(window[metric.key], plan.currency),
+            hint: metric.metric === "tokens" ? m("ui.metric_value", { v0: metric.label, v1: metric.exact(window[metric.key]) }) : null
           }))
         );
         if (window.cycle_anchor_at)
@@ -85,8 +76,7 @@ function renderPlans() {
 }
 
 function remainingQuota(usedPercent) {
-  const used = Number(usedPercent || 0);
-  const percent = 100 - Math.max(0, Math.min(100, Number.isFinite(used) ? used : 0));
+  const percent = 100 - Math.max(0, Math.min(100, usedPercent || 0));
   return { percent, level: percent >= 70 ? "high" : percent >= 30 ? "medium" : "low" };
 }
 
@@ -100,7 +90,7 @@ function quotaWindowResetLabel(row, showCountdown) {
   const resetAt = new Date(row.end_at);
   const remaining = (resetAt.getTime() - Date.now()) / 1000;
   return (
-    compactResetDate(resetAt) + (showCountdown ? DISPLAY_SEPARATOR + (remaining <= 0 ? m("ui.expired") : compactResetAfter(remaining)) : "")
+    compactResetDate(resetAt) + (showCountdown ? DISPLAY_SEPARATOR + (remaining <= 0 ? m("ui.expired") : compactTimeUntil(remaining)) : "")
   );
 }
 
@@ -112,11 +102,7 @@ function renderQuotaWindows(view, account = false) {
     view.windows.map((window) => {
       const dimensions = window.dimensions;
       const single = dimensions.length === 1;
-      const reset = el("span", {
-        class: "muted",
-        text: quotaWindowResetLabel(window, account),
-        "data-tip": window.started ? m("ui.resets_at_value", { v0: when(window.end_at) }) : null
-      });
+      const reset = el("span", { class: "muted", text: quotaWindowResetLabel(window, account) });
       return el(
         "div",
         { class: "quota-window" + (single ? " quota-single" : "") },
@@ -131,23 +117,10 @@ function renderQuotaWindows(view, account = false) {
             el(
               "div",
               { class: "quota-heading" },
-              el(single ? "b" : "span", {
-                class: single ? "" : "muted",
-                text: label,
-                "data-tip": single ? label : null,
-                "data-tip-overflow": ""
-              }),
+              el(single ? "b" : "span", { class: single ? "" : "muted", text: label }),
               el("span", {
                 class: "mono" + (balance.blocked ? " blocked" : ""),
-                text: metric.format(balance.remaining) + DISPLAY_SLASH + metric.format(balance.limit),
-                "data-tip": m("ui.valuevalueremaining_valuevalueused_value_value", {
-                  v0: metric.label,
-                  v1: DISPLAY_SEPARATOR,
-                  v2: metric.exact(balance.remaining),
-                  v3: DISPLAY_SEPARATOR,
-                  v4: metric.exact(balance.used),
-                  v5: metric.exact(balance.limit)
-                })
+                text: metric.format(balance.remaining, balance.currency) + DISPLAY_SLASH + metric.format(balance.limit, balance.currency)
               }),
               single ? reset : null
             ),
@@ -506,7 +479,6 @@ function addPlanWindow(quotaWindow = {}) {
         type: "button",
         class: "icon-action window-delete",
         "aria-label": m("ui.delete_window"),
-        "data-tip": m("ui.delete_window"),
         onclick: () => {
           row.remove();
           syncPlanWindows();
@@ -529,7 +501,7 @@ function addPlanWindow(quotaWindow = {}) {
           "aria-label": metric.inputLabel,
           type: "number",
           min: "0",
-          step: metric.key === "amount_usd" ? "any" : "1",
+          step: metric.key === "amount" ? "any" : "1",
           value: quotaWindow[metric.key] || "",
           placeholder: m("ui.unlimited")
         });
@@ -578,6 +550,7 @@ function editPlan(plan) {
     $("plan-id").value = id || "";
     setText($("plan-save"), current ? m("ui.save") : m("ui.create"));
     $("plan-name").value = current?.name || "";
+    $("plan-currency").value = current?.currency || "USD";
     $("plan-cycle-mode").value = current?.windows[0]?.cycle_anchor_at ? "unified" : "independent";
     $("plan-windows").replaceChildren();
     (current ? current.windows : [{}]).forEach(addPlanWindow);
@@ -614,11 +587,10 @@ function planFromForm() {
       const input = row.querySelector('[name="' + metric.key + '"]');
       const value = input.value === "" && !input.validity.badInput ? 0 : input.valueAsNumber;
       if (!Number.isFinite(value) || value < 0) invalid(input, m("ui.enter_a_valid_quota"));
-      else if (metric.key !== "amount_usd" && !Number.isSafeInteger(value)) invalid(input, m("ui.enter_a_valid_integer"));
+      else if (metric.key !== "amount" && !Number.isSafeInteger(value)) invalid(input, m("ui.enter_a_valid_integer"));
       limits[metric.key] = value;
     }
-    if (Object.values(limits).every((value) => value === 0))
-      invalid(row.querySelector('[name="amount_usd"]'), m("ui.set_at_least_one_quota"));
+    if (Object.values(limits).every((value) => value === 0)) invalid(row.querySelector('[name="amount"]'), m("ui.set_at_least_one_quota"));
     if (!validatePlanPeriod(row)) firstInvalid ||= periodInput;
     const anchor = validatePlanAnchor(row);
     const anchorInput = row.querySelector('[name="window_anchor"]');
@@ -636,12 +608,13 @@ function planFromForm() {
     firstInvalid.focus();
     return null;
   }
-  return { name: $("plan-name").value.trim(), windows, scopes: selectedKeyScopes("plan-key-list") };
+  return { name: $("plan-name").value.trim(), currency: $("plan-currency").value, windows, scopes: selectedKeyScopes("plan-key-list") };
 }
 
 $("plan-dialog").addEventListener("close", closeDateTimePickers);
 $("plan-dialog").addEventListener("scroll", closeDateTimePickers);
 addEventListener("resize", closeDateTimePickers);
+$("plan-currency").replaceChildren(...currencyOptions());
 $("plan-cycle-mode").onchange = syncPlanWindows;
 $("plan-window-add").onclick = () => addPlanWindow().querySelector("input").focus();
 $("plan-new").onclick = () => editPlan();
@@ -667,6 +640,7 @@ $("plan-save").onclick = () =>
     if (!editorCurrent(editor)) return false;
     if (id && sameScopes(plan.scopes, editor.initial.scopes)) delete plan.scopes;
     if (id && plan.name === existing.name) delete plan.name;
+    if (id && plan.currency === existing.currency) delete plan.currency;
     if (id && JSON.stringify(plan.windows) === JSON.stringify(existing.windows)) delete plan.windows;
     if (id && !Object.keys(plan).length) return;
     if (id) await mutateAdmin("PATCH", "/plans", { id, ...plan }); else await mutateAdmin("POST", "/plans", plan);

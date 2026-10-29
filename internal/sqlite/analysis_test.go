@@ -13,7 +13,7 @@ func TestAnalysisAggregatesOnlyDisplayedUsageDistributions(t *testing.T) {
 	view, err := database.Analysis(billing.RequestEventQuery{
 		From: eventStart.Add(-time.Hour),
 		To:   eventStart.Add(3 * time.Hour),
-	}, eventStart.Add(-billing.RequestEventRetention))
+	}, 7, eventStart.Add(-billing.RequestEventRetention))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestAnalysisDailyTrendUsesBrowserTimeZone(t *testing.T) {
 
 	view, err := database.Analysis(billing.RequestEventQuery{
 		From: from, To: from.Add(72 * time.Hour), Timezone: location,
-	}, from.Add(-billing.RequestEventRetention))
+	}, 7, from.Add(-billing.RequestEventRetention))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestAnalysisScopeSkipsTheRedundantKeyDimension(t *testing.T) {
 		Scope: "scope-a",
 		From:  eventStart.Add(-time.Hour),
 		To:    eventStart.Add(3 * time.Hour),
-	}, eventStart.Add(-billing.RequestEventRetention))
+	}, 7, eventStart.Add(-billing.RequestEventRetention))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,50 +99,82 @@ func TestAnalysisScopeSkipsTheRedundantKeyDimension(t *testing.T) {
 	}
 }
 
-func TestAnalysisSummaryIncludesTokenAndCostBreakdowns(t *testing.T) {
+func TestAnalysisIncludesTokenAndCostBreakdowns(t *testing.T) {
 	database := openTestDB(t)
 	state := billing.NewState()
 	state.Keys["scope-a"] = &billing.KeyState{Preview: "sk-tes…0001"}
 	event := requestEvent("scope-a", eventStart)
 	event.Cost = billing.Cost{
-		TotalUSD:            5,
-		UncachedInputUSD:    1,
-		CacheReadUSD:        3,
-		CacheWriteUSD:       0.5,
-		OutputUSD:           0.5,
+		Currency:            billing.USD,
+		Total:               5,
+		UncachedInput:       1,
+		CacheRead:           3,
+		CacheWrite:          0.5,
+		Output:              0.5,
 		UncachedInputTokens: 100,
 		CacheReadTokens:     300,
 		CacheWriteTokens:    50,
 		BilledOutputTokens:  50,
 	}
+	failed := requestEvent("scope-a", eventStart.Add(75*time.Minute))
+	failed.Cost = billing.Cost{UncachedInputTokens: 400, CacheReadTokens: 100, BilledOutputTokens: 100}
+	zeroInput := requestEvent("scope-b", eventStart)
+	zeroInput.BillingModel, zeroInput.Account = "output-only", "zero@example.com"
+	zeroInput.Cost = billing.Cost{Currency: billing.CNY, Total: 7, Output: 7, BilledOutputTokens: 40}
+	outside := requestEvent("scope-a", eventStart.Add(2*time.Hour))
 	mustSave(t, database, state, billing.Changes{
-		AllKeys:             true,
-		NormalRequestEvents: []billing.RequestEvent{event},
+		AllKeys: true, NormalRequestEvents: []billing.RequestEvent{event, zeroInput, outside},
+		RequestErrorEvents: []billing.RequestErrorEvent{{Event: failed}},
 	})
 
-	view, err := database.Analysis(billing.RequestEventQuery{
-		From: eventStart.Add(-time.Minute),
-		To:   eventStart.Add(time.Minute),
-	}, eventStart.Add(-billing.RequestEventRetention))
+	query := billing.RequestEventQuery{From: eventStart, To: eventStart.Add(2 * time.Hour)}
+	view, err := database.Analysis(query, 7, eventStart)
 	if err != nil {
 		t.Fatal(err)
 	}
 	summary := view.Summary
-	if summary.TotalTokens != 500 || summary.InputTokens != 450 || summary.OutputTokens != 50 ||
-		summary.CacheReadTokens != 300 || summary.CacheWriteTokens != 50 ||
-		math.Abs(summary.CacheRate-200.0/3) > 1e-9 {
+	if summary.Requests != 3 || summary.Failed != 1 || summary.TotalTokens != 1140 || summary.InputTokens != 950 || summary.OutputTokens != 190 ||
+		summary.CacheReadTokens != 400 || summary.CacheWriteTokens != 50 ||
+		math.Abs(summary.CacheRate-800.0/19) > 1e-9 {
 		t.Fatalf("token summary = %+v", summary)
 	}
-	if summary.Cost.TotalUSD != 5 || summary.Cost.InputUSD != 1 ||
+	// CNY costs convert into USD at the rate; a total of both has no currency of its own.
+	if summary.Cost.TotalUSD != 6 || summary.Cost.InputUSD != 1 ||
 		summary.Cost.CacheReadUSD != 3 || summary.Cost.CacheWriteUSD != 0.5 ||
-		summary.Cost.OutputUSD != 0.5 {
+		summary.Cost.OutputUSD != 1.5 || summary.Cost.ChargedIn != "" {
 		t.Fatalf("cost summary = %+v", summary.Cost)
 	}
 	trends := view.Trends
-	if len(trends.UncachedInputTokens) != 1 || trends.UncachedInputTokens[0].Value != 100 ||
-		trends.OutputTokens[0].Value != 50 || trends.CacheReadTokens[0].Value != 300 ||
-		trends.CacheWriteTokens[0].Value != 50 || trends.TotalTokens[0].Value != 500 {
+	if len(trends.UncachedInputTokens) != 2 || trends.UncachedInputTokens[0].Value != 100 ||
+		trends.OutputTokens[0].Value != 90 || trends.CacheReadTokens[0].Value != 300 ||
+		trends.CacheWriteTokens[0].Value != 50 || trends.TotalTokens[0].Value != 540 || trends.TotalTokens[1].Value != 600 {
 		t.Fatalf("token trends = %+v", trends)
+	}
+	for name, rows := range map[string][]billing.AnalysisComposition{
+		"keys": view.UsageDistribution.APIKeys, "models": view.UsageDistribution.Models, "sources": view.UsageDistribution.Sources,
+	} {
+		if len(rows) != 2 {
+			t.Fatalf("%s distribution = %+v", name, rows)
+		}
+		row := rows[0]
+		if row.Requests != 2 || row.TotalTokens != 1100 || row.InputTokens != 950 || row.OutputTokens != 150 ||
+			row.CacheReadTokens != 400 || row.CacheWriteTokens != 50 || row.ChargedIn != billing.USD {
+			t.Errorf("%s token breakdown = %+v", name, row)
+		}
+		zero := rows[1]
+		if zero.InputTokens != 0 || zero.OutputTokens != 40 || zero.TotalTokens != 40 || zero.CacheReadTokens != 0 || zero.CacheWriteTokens != 0 ||
+			zero.ChargedIn != billing.CNY {
+			t.Errorf("%s output-only breakdown = %+v", name, zero)
+		}
+	}
+	query.Scope = "scope-a"
+	scoped, err := database.Analysis(query, 7, eventStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped.UsageDistribution.APIKeys) != 0 || len(scoped.UsageDistribution.Models) != 1 || len(scoped.UsageDistribution.Sources) != 1 ||
+		scoped.UsageDistribution.Models[0].InputTokens != 950 || scoped.UsageDistribution.Sources[0].CacheReadTokens != 400 {
+		t.Fatalf("scoped distribution = %+v", scoped.UsageDistribution)
 	}
 }
 
@@ -164,7 +196,7 @@ func TestAnalysisFullRetentionKeepsZeroUsageAndEmptyScopes(t *testing.T) {
 			{Event: billing.RequestEvent{At: to.Add(-time.Nanosecond), Scope: "orphan"}},
 		},
 	})
-	view, err := d.Analysis(billing.RequestEventQuery{From: from, To: to, Timezone: location}, from)
+	view, err := d.Analysis(billing.RequestEventQuery{From: from, To: to, Timezone: location}, 7, from)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +223,7 @@ func TestAnalysisFallbackLabelsDoNotMergeUserDefinedModels(t *testing.T) {
 		events = append(events, billing.RequestEvent{At: from, BillingModel: model})
 	}
 	mustSave(t, d, billing.NewState(), billing.Changes{NormalRequestEvents: events})
-	view, err := d.Analysis(billing.RequestEventQuery{From: from, To: from.Add(time.Hour)}, from)
+	view, err := d.Analysis(billing.RequestEventQuery{From: from, To: from.Add(time.Hour)}, 7, from)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,5 +235,42 @@ func TestAnalysisFallbackLabelsDoNotMergeUserDefinedModels(t *testing.T) {
 		if model.Requests != 1 || (model.Key != "" && model.Label != model.Key) {
 			t.Fatalf("user-defined model was changed: %+v", model)
 		}
+	}
+}
+
+func TestAnalysisSpeedMeasuresTPSOfOneModel(t *testing.T) {
+	database := openTestDB(t)
+	event := func(offset time.Duration, latency, output int64) billing.RequestEvent {
+		entry := requestEvent("scope-a", eventStart.Add(offset))
+		entry.LatencyMS, entry.Cost.BilledOutputTokens = latency, output
+		return entry
+	}
+	unmeasured := event(40*time.Minute, 1000, 300)
+	unmeasured.AccountingQuality = billing.TokenAccountingUnclassified
+	otherModel := event(12*time.Minute, 100, 900)
+	otherModel.BillingModel = "gpt-5.6-luna"
+	failed := event(15*time.Minute, 1000, 100)
+	failed.Failed = true
+	mustSave(t, database, billing.NewState(), billing.Changes{
+		NormalRequestEvents: []billing.RequestEvent{
+			event(10*time.Minute, 1000, 100), event(20*time.Minute, 2000, 100), event(30*time.Minute, 4000, 100),
+			event(45*time.Minute, 1000, 0), event(70*time.Minute, 2000, 100), unmeasured, otherModel,
+		},
+		RequestErrorEvents: []billing.RequestErrorEvent{{Event: failed, Error: billing.RequestError{StatusCode: 502}}},
+	})
+
+	view, err := database.AnalysisSpeed(billing.RequestEventQuery{
+		Model: "gpt-5.5", From: eventStart, To: eventStart.Add(2 * time.Hour),
+	}, eventStart.Add(-billing.RequestEventRetention))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Trend) != 2 || !view.Trend[1].Time.Equal(eventStart.Add(time.Hour)) ||
+		view.Trend[0].SpeedStats != (billing.SpeedStats{Samples: 3, P10: 30, P25: 37.5, P50: 50, P75: 75, P90: 90}) ||
+		view.Trend[1].Samples != 1 || view.Trend[1].P50 != 50 {
+		t.Fatalf("speed trend = %+v", view.Trend)
+	}
+	if view.Summary.Samples != 4 || view.Summary.P50 != 50 {
+		t.Fatalf("summary = %+v", view.Summary)
 	}
 }

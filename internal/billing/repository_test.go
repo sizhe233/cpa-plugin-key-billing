@@ -18,8 +18,28 @@ type memoryRepository struct {
 	closeFail       error
 }
 
-func (r *memoryRepository) CredentialUsage(authIndexes []string, scope string, since time.Time) (map[string]CredentialUsage, error) {
-	return map[string]CredentialUsage{}, r.fail
+func (r *memoryRepository) CredentialUsageStats([]string, string, time.Time, time.Time, ExchangeRate) (map[string]CredentialUsageStats, error) {
+	return map[string]CredentialUsageStats{}, r.fail
+}
+
+func (r *memoryRepository) LatestQuotaReports([]string, time.Time) (map[string][]QuotaObservation, error) {
+	return map[string][]QuotaObservation{}, r.fail
+}
+
+func (r *memoryRepository) QuotaWindowHistories(string, string, time.Time, time.Time) ([]QuotaWindowHistory, error) {
+	return nil, r.fail
+}
+
+func (r *memoryRepository) UsageTotal(string, UsageQuery, ExchangeRate) (UsageTotal, error) {
+	return UsageTotal{}, r.fail
+}
+
+func (r *memoryRepository) UsageByModel(string, UsageQuery, ExchangeRate) ([]ModelUsage, error) {
+	return nil, r.fail
+}
+
+func (r *memoryRepository) UsageSources(string, UsageQuery) ([]string, error) {
+	return nil, r.fail
 }
 
 func (r *memoryRepository) Load(requestCutoff, pluginCutoff time.Time) (Snapshot, error) {
@@ -162,8 +182,12 @@ func (r *memoryRepository) RequestErrors(query RequestErrorQuery, since time.Tim
 	return view, nil
 }
 
-func (r *memoryRepository) Analysis(query RequestEventQuery, since time.Time) (AnalysisView, error) {
+func (r *memoryRepository) Analysis(query RequestEventQuery, rate ExchangeRate, since time.Time) (AnalysisView, error) {
 	return AnalysisView{}, nil
+}
+
+func (r *memoryRepository) AnalysisSpeed(query RequestEventQuery, since time.Time) (AnalysisSpeedView, error) {
+	return AnalysisSpeedView{}, nil
 }
 
 func (r *memoryRepository) Close() error { return r.closeFail }

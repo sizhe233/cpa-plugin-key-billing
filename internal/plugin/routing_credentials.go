@@ -1,9 +1,14 @@
 package plugin
 
 import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -15,6 +20,7 @@ type credentialView struct {
 	Ref            string           `json:"ref"`
 	Source         string           `json:"source"`
 	Provider       string           `json:"provider"`
+	ProviderName   string           `json:"provider_name"`
 	DisplayName    string           `json:"display_name"`
 	DisplayMessage messages.Message `json:"display_name_message,omitzero"`
 	Status         string           `json:"status,omitempty"`
@@ -55,14 +61,13 @@ func safeCredentialName(raw, account, provider, ref string) string {
 	return name
 }
 
+// providerName names a provider its configuration leaves unnamed. CPA keys an
+// OpenAI-compatible provider by its lowercased configured name.
+func providerName(provider string) string { return strings.TrimPrefix(provider, "openai-compatible-") }
+
 func credentialDisplayName(file hostAuthFile, source, provider, ref string) string {
 	if source == billing.CredentialSourceAuthFiles {
-		// Authentication-file identity comes only from CPA's explicit email.
-		email := cleanText(file.Email)
-		if email == "" {
-			return "No email provided"
-		}
-		return email
+		return authFileTitle(file)
 	}
 	name := file.Label
 	if strings.TrimSpace(name) == "" {
@@ -73,11 +78,14 @@ func credentialDisplayName(file hostAuthFile, source, provider, ref string) stri
 
 func credentialSourceFromHost(file hostAuthFile) string {
 	source := strings.ToLower(strings.TrimSpace(file.Source))
-	if file.RuntimeOnly || source == "memory" || source == "config" || strings.HasPrefix(source, "config:") {
+	if file.RuntimeOnly {
 		return billing.CredentialSourceAIProviders
 	}
 	if source == "file" || strings.TrimSpace(file.Path) != "" {
 		return billing.CredentialSourceAuthFiles
+	}
+	if source == "memory" || source == "config" || strings.HasPrefix(source, "config:") {
+		return billing.CredentialSourceAIProviders
 	}
 	return ""
 }
@@ -118,13 +126,118 @@ func credentialSourceFromCandidate(candidate SchedulerAuthCandidate) string {
 	return ""
 }
 
+// Display data synchronized by the UI is not evidence of credential identity.
+// Config credentials use the immutable identity observed in host candidates;
+// physical auth files are checked against the current host runtime entry.
+func (a *App) selectedCredentialAllowed(req RequestInterceptRequest, decision billing.RoutingDecision) (bool, error) {
+	id := metadataString(req.Metadata, MetadataSelectedAuth)
+	if id == "" {
+		return false, errors.New("The host did not report the selected upstream credential")
+	}
+	ref := billing.CredentialFingerprint(id)
+	if slices.Contains(decision.DeniedCredentialIDs, ref) ||
+		len(decision.CredentialProviders) == 0 && len(decision.CredentialIDs) > 0 && !slices.Contains(decision.CredentialIDs, ref) {
+		return false, nil
+	}
+	if len(decision.DeniedCredentialProviders) == 0 && decision.AllowsCredential(ref, "", "") {
+		return true, nil
+	}
+	a.routingMu.Lock()
+	identity := a.credentialIdentities[id]
+	a.routingMu.Unlock()
+	if identity.Source != billing.CredentialSourceAIProviders {
+		index := metadataString(req.Metadata, MetadataSelectedIndex)
+		if index == "" || a.hostCaller == nil {
+			return false, errors.New("The host did not provide enough information to verify the selected upstream credential")
+		}
+		raw, err := a.hostCaller(hostAuthGetRuntime, map[string]string{"auth_index": index})
+		if err != nil {
+			return false, errors.New("The host could not provide runtime information for the selected upstream credential")
+		}
+		var response struct {
+			Auth hostAuthFile `json:"auth"`
+		}
+		if err := json.Unmarshal(raw, &response); err != nil || response.Auth.ID != id || response.Auth.AuthIndex != index {
+			return false, errors.New("The host returned inconsistent identity information for the selected upstream credential")
+		}
+		identity = billing.CredentialProviderSelector{
+			Source:   credentialSourceFromHost(response.Auth),
+			Provider: strings.ToLower(strings.TrimSpace(firstNonEmptyString(response.Auth.Provider, response.Auth.Type))),
+		}
+	}
+	if identity.Source == "" || identity.Provider == "" {
+		return false, errors.New("The host did not identify the source and provider of the selected upstream credential")
+	}
+	a.routingMu.Lock()
+	a.credentialIdentities[id] = identity
+	a.routingMu.Unlock()
+	return routingAllowsCredential(id, identity.Source, identity.Provider, decision), nil
+}
+
+// host.auth.models backs model catalog filtering and explains routed requests
+// left without a credential. Older hosts fail this probe.
+func (a *App) probeHostAuthModels() bool {
+	if a.hostCaller == nil {
+		return false
+	}
+	if _, err := a.hostCaller(hostAuthModels, map[string]any{}); err != nil {
+		a.store.AddPluginLog(billing.PluginLogDebug, "Upstream credential models are unavailable: %v", err)
+		return false
+	}
+	return true
+}
+
+// credentialModels collects the models served by credentials the rules allow.
+// Sources matter only to provider selectors. host.auth.list omits exactly the
+// config-backed credentials, so a credential it does not list is an AI
+// provider key.
+func (a *App) credentialModels(decision billing.RoutingDecision) (map[string]bool, error) {
+	raw, err := a.hostCaller(hostAuthModels, map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		Credentials []struct {
+			ID       string   `json:"id"`
+			Provider string   `json:"provider"`
+			Models   []string `json:"models"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("Parse credential models: %w", err)
+	}
+	sources := map[string]string{}
+	if len(decision.CredentialProviders) > 0 || len(decision.DeniedCredentialProviders) > 0 {
+		files, err := a.listHostAuthFiles()
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			sources[file.ID] = credentialSourceFromHost(file)
+		}
+	}
+	provided := map[string]bool{}
+	for _, credential := range response.Credentials {
+		source, listed := sources[credential.ID]
+		if !listed {
+			source = billing.CredentialSourceAIProviders
+		}
+		if routingAllowsCredential(credential.ID, source, credential.Provider, decision) {
+			for _, model := range credential.Models {
+				provided[model] = true
+			}
+		}
+	}
+	return provided, nil
+}
+
 func (a *App) refreshCredentialInventory() error {
 	files, err := a.listHostAuthFiles()
 	if err != nil {
 		return err
 	}
 	next := make(map[string]credentialView, len(files))
-	raw := make(map[string]string, len(files))
+	raw := make(map[string]billing.CredentialProviderSelector, len(files))
 	for _, file := range files {
 		id := strings.TrimSpace(file.ID)
 		if id == "" {
@@ -139,15 +252,10 @@ func (a *App) refreshCredentialInventory() error {
 		if source == "" {
 			continue
 		}
-		next[ref] = credentialView{Ref: ref, Source: source, Provider: provider,
+		next[ref] = credentialView{Ref: ref, Source: source, Provider: provider, ProviderName: providerName(provider),
 			DisplayName: credentialDisplayName(file, source, provider, ref), Status: file.Status,
 			Disabled: file.Disabled, Unavailable: file.Unavailable}
-		if source == billing.CredentialSourceAuthFiles && cleanText(file.Email) == "" {
-			item := next[ref]
-			item.DisplayMessage = messages.New("No email provided")
-			next[ref] = item
-		}
-		raw[id] = ref
+		raw[id] = billing.CredentialProviderSelector{Source: source, Provider: provider}
 	}
 	a.routingMu.Lock()
 	// host.auth.list may omit config-backed credentials.
@@ -158,12 +266,14 @@ func (a *App) refreshCredentialInventory() error {
 			}
 		}
 	}
-	for id, ref := range a.credentialsByRawID {
-		if _, ok := next[ref]; ok {
-			raw[id] = ref
+	for id, identity := range a.credentialIdentities {
+		if _, listed := raw[id]; !listed && identity.Source == billing.CredentialSourceAIProviders {
+			if _, ok := next[billing.CredentialFingerprint(id)]; ok {
+				raw[id] = identity
+			}
 		}
 	}
-	a.credentials, a.credentialsByRawID = next, raw
+	a.credentials, a.credentialIdentities = next, raw
 	a.routingMu.Unlock()
 	return nil
 }
@@ -179,33 +289,27 @@ func (a *App) observeCandidates(candidates []SchedulerAuthCandidate) {
 		ref := billing.CredentialFingerprint(id)
 		source := credentialSourceFromCandidate(candidate)
 		if source == "" {
+			delete(a.credentialIdentities, id)
 			continue
 		}
 		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		name := "Configured credential " + shortCredentialRef(ref)
-		detail := messages.New("Configured credential %s", shortCredentialRef(ref))
+		short := shortCredentialRef(ref)
+		view := credentialView{Ref: ref, Source: source, Provider: provider, ProviderName: providerName(provider), Status: candidate.Status,
+			DisplayName: "Configured credential " + short, DisplayMessage: messages.New("Configured credential %s", short)}
 		if source == billing.CredentialSourceAuthFiles {
-			name = "No email provided"
-			detail = messages.New("No email provided")
+			// A file credential's ID is its path under the auth directory.
+			view.DisplayName, view.DisplayMessage = authFileTitle(hostAuthFile{Name: filepath.Base(id)}), messages.Message{}
 		}
 		if existing, ok := a.credentials[ref]; ok && existing.DisplayName != "" {
-			name = existing.DisplayName
-			detail = existing.DisplayMessage
+			view.ProviderName, view.DisplayName, view.DisplayMessage = existing.ProviderName, existing.DisplayName, existing.DisplayMessage
 		}
-		a.credentials[ref] = credentialView{Ref: ref, Source: source, Provider: provider, DisplayName: name, DisplayMessage: detail, Status: candidate.Status}
-		a.credentialsByRawID[id] = ref
+		a.credentials[ref] = view
+		a.credentialIdentities[id] = billing.CredentialProviderSelector{Source: source, Provider: provider}
 	}
 }
 
-func (a *App) observeCredentialUsage(authIndex, authType, source, scope string) {
-	if !strings.EqualFold(strings.TrimSpace(authType), "apikey") {
-		return
-	}
-	if billing.CallerScope(source) == strings.TrimSpace(scope) {
-		return
-	}
-	name := billing.PreviewKey(source)
-	if name == "" {
+func (a *App) observeCredentialUsage(authIndex, authType, account string) {
+	if !strings.EqualFold(strings.TrimSpace(authType), "apikey") || account == "" {
 		return
 	}
 	a.routingMu.Lock()
@@ -215,64 +319,19 @@ func (a *App) observeCredentialUsage(authIndex, authType, source, scope string) 
 	if !ok || credential.Source != billing.CredentialSourceAIProviders {
 		return
 	}
-	credential.DisplayName = name
+	credential.DisplayName = account
 	credential.DisplayMessage = messages.Message{}
 	a.credentials[ref] = credential
 }
 
-func (a *App) syncConfiguredCredentials(req ManagementRequest) ManagementResponse {
-	var body struct {
-		Credentials []struct {
-			Ref         string `json:"ref"`
-			Provider    string `json:"provider"`
-			DisplayName string `json:"display_name"`
-			Disabled    bool   `json:"disabled"`
-		} `json:"credentials"`
-	}
-	if errDecode := decodeStrict(req.Body, &body); errDecode != nil {
-		return errorResponse(errDecode)
-	}
-	if len(body.Credentials) > 4096 {
-		return JSONError(http.StatusBadRequest, "invalid", "Too many configured credentials")
-	}
-
-	next := make(map[string]billing.ConfigCredential, len(body.Credentials))
-	for _, item := range body.Credentials {
-		ref := strings.ToLower(strings.TrimSpace(item.Ref))
-		provider := strings.ToLower(strings.TrimSpace(item.Provider))
-		if !billing.ValidCredentialFingerprint(ref) || provider == "" || len(provider) > 160 || cleanText(provider) != provider {
-			return JSONError(http.StatusBadRequest, "invalid", "Invalid configured credential identifier")
-		}
-		preview := cleanText(item.DisplayName)
-		// Accept the old UI sentinel during upgrades; new clients send an empty value.
-		if preview == "No API key configured" || preview == "未配置 API Key" {
-			preview = ""
-		}
-		next[ref] = billing.ConfigCredential{
-			Provider: provider, KeyPreview: billing.PreviewKey(preview), Disabled: item.Disabled,
-		}
-	}
-
-	if err := func() error {
-		a.routingMu.Lock()
-		defer a.routingMu.Unlock()
-		previous := a.store.ConfigCredentials()
-		if err := a.store.SyncConfigCredentials(next); err != nil {
-			return err
-		}
-		a.replaceSyncedCredentials(previous, next)
-		return nil
-	}(); err != nil {
-		return errorResponse(err)
-	}
-	return JSONResponse(http.StatusOK, map[string]any{"credentials": a.credentialInventory()})
-}
-
 // Caller holds routingMu across persistence and inventory publication.
 func (a *App) replaceSyncedCredentials(previous, next map[string]billing.ConfigCredential) {
-	for id, ref := range a.credentialsByRawID {
+	for id := range a.credentialIdentities {
+		ref := billing.CredentialFingerprint(id)
 		if _, synced := previous[ref]; synced {
-			delete(a.credentialsByRawID, id)
+			if _, retained := next[ref]; !retained {
+				delete(a.credentialIdentities, id)
+			}
 		}
 	}
 	for ref := range previous {
@@ -290,7 +349,7 @@ func (a *App) replaceSyncedCredentials(previous, next map[string]billing.ConfigC
 			status = "disabled"
 		}
 		a.credentials[ref] = credentialView{
-			Ref: ref, Source: billing.CredentialSourceAIProviders, Provider: item.Provider,
+			Ref: ref, Source: billing.CredentialSourceAIProviders, Provider: item.Provider, ProviderName: cmp.Or(item.Name, providerName(item.Provider)),
 			DisplayName: name, DisplayMessage: detail, Status: status, Disabled: item.Disabled,
 		}
 	}
@@ -330,7 +389,7 @@ func (a *App) credentialLabels(refs []string) map[string]string {
 	labels := make(map[string]string, len(refs))
 	for _, ref := range refs {
 		if item, ok := a.credentials[ref]; ok {
-			labels[ref] = item.Provider + " · " + item.DisplayName
+			labels[ref] = item.ProviderName + " · " + item.DisplayName
 		}
 	}
 	return labels
@@ -346,11 +405,15 @@ func (a *App) listCredentials(_ ManagementRequest) ManagementResponse {
 func (a *App) credentialByRawID(id string) (credentialView, bool) {
 	a.routingMu.Lock()
 	defer a.routingMu.Unlock()
-	ref, ok := a.credentialsByRawID[strings.TrimSpace(id)]
-	if !ok {
-		return credentialView{}, false
+	id = strings.TrimSpace(id)
+	item, ok := a.credentials[billing.CredentialFingerprint(id)]
+	if identity, known := a.credentialIdentities[id]; known {
+		// A synced name belongs to the provider the UI reported.
+		if identity.Provider != item.Provider {
+			item.ProviderName = providerName(identity.Provider)
+		}
+		item.Source, item.Provider = identity.Source, identity.Provider
 	}
-	item, ok := a.credentials[ref]
 	return item, ok
 }
 

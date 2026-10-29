@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -15,39 +16,98 @@ import (
 // Bound the retry hint so clients periodically recheck quota availability.
 const maxRetryAfterSeconds = 3600
 
-// Only in-flight admission calls need a completion marker. Once they return,
-// the Store's concurrency slots are sufficient for lifecycle bookkeeping.
-type requestAdmission struct {
-	calls     int
-	completed bool
+const (
+	maxRequestOrigins = 16384
+	// Client headers are display metadata; longer values stay unknown rather
+	// than widening every stored request.
+	maxClientHeaderBytes = 1024
+)
+
+type requestOriginKey struct {
+	traceID, scope string
 }
 
-func (a *App) beginAdmission(requestID string) *requestAdmission {
-	requestID = strings.TrimSpace(requestID)
-	if requestID == "" {
-		return nil
-	}
-	a.admissionsMu.Lock()
-	defer a.admissionsMu.Unlock()
-	admission := a.admissions[requestID]
-	if admission == nil {
-		admission = &requestAdmission{}
-		a.admissions[requestID] = admission
-	}
-	admission.calls++
-	return admission
+type requestOrigin struct {
+	key requestOriginKey
+	billing.RequestOrigin
 }
 
-func (a *App) endAdmission(requestID string, admission *requestAdmission) {
-	if admission == nil {
+// Retain origins after request.complete: usage is asynchronous and retries or
+// WebSocket turns can report more than one record for the same inbound trace.
+func (a *App) rememberRequestOrigin(req RequestInterceptRequest, scope, endpoint string) {
+	key := requestOriginKey{strings.TrimSpace(req.TraceID), scope}
+	endpoint = requestEndpoint(endpoint)
+	if key.traceID == "" || endpoint == "" {
 		return
 	}
-	a.admissionsMu.Lock()
-	defer a.admissionsMu.Unlock()
-	admission.calls--
-	if admission.calls == 0 {
-		delete(a.admissions, strings.TrimSpace(requestID))
+	reported := billing.RequestOrigin{
+		Endpoint:      endpoint,
+		Transport:     "http",
+		UserAgent:     clientHeader(req.Headers.Get("User-Agent")),
+		XForwardedFor: clientHeader(strings.Join(req.Headers.Values("X-Forwarded-For"), ", ")),
 	}
+	if headerHasToken(req.Headers, "Connection", "upgrade") && headerHasToken(req.Headers, "Upgrade", "websocket") {
+		reported.Transport = "websocket"
+	}
+	a.requestOriginsMu.Lock()
+	defer a.requestOriginsMu.Unlock()
+	if entry := a.requestOrigins[key]; entry != nil {
+		origin := entry.Value.(*requestOrigin)
+		if origin.RequestOrigin != reported {
+			// Conflicting metadata stays unknown for the retained trace.
+			origin.RequestOrigin = billing.RequestOrigin{}
+		}
+		a.requestOriginOrder.MoveToFront(entry)
+		return
+	}
+	a.requestOrigins[key] = a.requestOriginOrder.PushFront(&requestOrigin{key, reported})
+	if len(a.requestOrigins) > maxRequestOrigins {
+		oldest := a.requestOriginOrder.Back()
+		delete(a.requestOrigins, oldest.Value.(*requestOrigin).key)
+		a.requestOriginOrder.Remove(oldest)
+	}
+}
+
+func (a *App) findRequestOrigin(traceID, scope string) billing.RequestOrigin {
+	a.requestOriginsMu.Lock()
+	defer a.requestOriginsMu.Unlock()
+	entry := a.requestOrigins[requestOriginKey{strings.TrimSpace(traceID), scope}]
+	if entry == nil {
+		return billing.RequestOrigin{}
+	}
+	a.requestOriginOrder.MoveToFront(entry)
+	return entry.Value.(*requestOrigin).RequestOrigin
+}
+
+func clientHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > maxClientHeaderBytes {
+		return ""
+	}
+	return value
+}
+
+func requestEndpoint(raw string) string {
+	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") || len(raw) > 4096 {
+		return ""
+	}
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return ""
+	}
+	// Persist only the route path, never query parameters or headers.
+	return parsed.EscapedPath()
+}
+
+func headerHasToken(headers http.Header, name, token string) bool {
+	for _, value := range headers.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Enforcement runs before auth so an over-quota request never occupies an
@@ -57,15 +117,7 @@ func (a *App) interceptBeforeAuth(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("Parse request interception parameters: %w", errUnmarshal)
 	}
-	if a == nil || a.store == nil {
-		return OKEnvelope(RequestInterceptResponse{})
-	}
 	helper := metadataString(req.Metadata, MetadataSource) == SourcePluginHostModelCallback
-	var admission *requestAdmission
-	if !helper {
-		admission = a.beginAdmission(req.RequestID)
-		defer a.endAdmission(req.RequestID, admission)
-	}
 	if !a.store.Enabled() {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
@@ -74,11 +126,9 @@ func (a *App) interceptBeforeAuth(raw []byte) ([]byte, error) {
 
 	// Reject disallowed models before quota checks can open a subscription period.
 	if !helper {
+		a.rememberRequestOrigin(req, scope, endpoint)
 		routing := a.store.ResolveRouting(scope, req.Model, req.RequestedModel)
 		a.beginRouteLog(req.RequestID, scope, routing)
-		if routing.ConfigurationError != "" {
-			return OKEnvelope(routingConfigurationResponse(req.SourceFormat, routing.ConfigurationError))
-		}
 		if routing.RestrictsModels() && !routing.AllowsModel() {
 			return OKEnvelope(modelForbiddenResponse(req.SourceFormat, routing))
 		}
@@ -88,39 +138,23 @@ func (a *App) interceptBeforeAuth(raw []byte) ([]byte, error) {
 	if priceErr != nil {
 		return OKEnvelope(priceRefusal(req.SourceFormat, "price_storage_error", "Failed to load model pricing. Please try again later."))
 	}
-	if price.Source == billing.PriceSourceNone {
+	if price.Source == billing.PriceSourceNone && !a.store.Config().AllowUnpricedModels {
 		return OKEnvelope(priceRefusal(req.SourceFormat, "model_price_error", fmt.Sprintf("Model %s has no configured price", model)))
 	}
 	if helper {
-		// Nested plugin helpers do not consume another client admission slot, but
-		// still need a price: usage.handle can attribute their usage to the client.
+		// Nested plugin helpers follow the same pricing policy because usage.handle
+		// can attribute their usage to the client, but consume no extra admission slot.
 		return OKEnvelope(RequestInterceptResponse{})
 	}
 	generate := true
 	if value, ok := req.Metadata[MetadataGenerate].(bool); ok {
 		generate = value
 	}
-	// Completion and the final admission commit share this lock. Checking the
-	// marker alone would still let completion race with slot/cycle creation.
-	a.admissionsMu.Lock()
-	defer a.admissionsMu.Unlock()
-	if admission != nil && admission.completed {
-		return OKEnvelope(priceRefusal(req.SourceFormat, "request_completed", "The request has already completed"))
-	}
-	slot := billing.SlotDecision{Allowed: true}
-	admitted := false
 	if generate {
-		slot = a.store.AcquireSlot(scope, req.RequestID)
+		slot := a.store.AcquireSlot(scope, req.RequestID)
 		if !slot.Allowed {
 			return OKEnvelope(concurrencyLimitResponse(req.SourceFormat, slot))
 		}
-		defer func() {
-			// A panic or a later admission refusal must not leak the slot. Once
-			// admitted, request.complete owns the release path.
-			if slot.Acquired && !admitted {
-				a.store.ReleaseSlot(req.RequestID)
-			}
-		}()
 	}
 
 	// Reference price refresh may have taken time. Quota and Retry-After share the
@@ -128,11 +162,13 @@ func (a *App) interceptBeforeAuth(raw []byte) ([]byte, error) {
 	now := a.store.Now()
 	decision := a.store.Authorize(scope, now)
 	if !decision.Allowed {
+		if generate {
+			a.store.ReleaseSlot(req.RequestID)
+		}
 		a.store.ReportQuotaBlock(scope, endpoint, decision)
 		return OKEnvelope(quotaExhaustedResponse(req.SourceFormat, decision, now))
 	}
 
-	admitted = true
 	return OKEnvelope(RequestInterceptResponse{})
 }
 
@@ -141,14 +177,33 @@ func (a *App) interceptAfterAuth(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("Parse post-auth request interception parameters: %w", errUnmarshal)
 	}
-	if a != nil {
-		a.observeRouteCredential(
-			req.RequestID,
-			metadataString(req.Metadata, MetadataSelectedAuth),
-			metadataString(req.Metadata, MetadataSelectedIndex),
-		)
+	result, detail := "unrestricted", ""
+	var response RequestInterceptResponse
+	if a.store.Enabled() && metadataString(req.Metadata, MetadataSource) != SourcePluginHostModelCallback {
+		// Credential permissions are independent of model aliases. Recheck the
+		// current policy even when another scheduler made the selection.
+		scope := metadataString(req.Metadata, MetadataCallerScope)
+		decision := a.store.ResolveRouting(scope, req.Model, req.RequestedModel)
+		a.beginRouteLog(req.RequestID, scope, decision)
+		if decision.RestrictsCredentials() {
+			allowed, err := a.selectedCredentialAllowed(req, decision)
+			switch {
+			case err != nil:
+				result, detail = "unverified", err.Error()
+				response = routingErrorResponse(req.SourceFormat, "routing_credential_unverified", detail)
+			case !allowed:
+				result, detail = "deny", "The selected upstream credential is not permitted by this API key's routing rules"
+				response = routingErrorResponse(req.SourceFormat, "routing_credential_mismatch", detail)
+			default:
+				result = "allow"
+			}
+		}
 	}
-	return OKEnvelope(RequestInterceptResponse{})
+	if id := metadataString(req.Metadata, MetadataSelectedAuth); !response.Terminate && id != "" {
+		a.store.AssignSlotCredential(req.RequestID, billing.CredentialFingerprint(id))
+	}
+	a.observeRouteCredential(req, result, detail)
+	return OKEnvelope(response)
 }
 
 func (a *App) completeRequest(raw []byte) ([]byte, error) {
@@ -156,22 +211,13 @@ func (a *App) completeRequest(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &completion); errUnmarshal != nil {
 		return nil, fmt.Errorf("Parse request completion event: %w", errUnmarshal)
 	}
-	if a != nil && a.store != nil {
-		func() {
-			a.admissionsMu.Lock()
-			defer a.admissionsMu.Unlock()
-			if admission := a.admissions[strings.TrimSpace(completion.RequestID)]; admission != nil {
-				admission.completed = true
-			}
-			a.store.ReleaseSlot(completion.RequestID)
-		}()
-		a.finishRouteLog(completion)
-	}
+	a.store.ReleaseSlot(completion.RequestID)
+	a.finishRouteLog(completion)
 	return OKEnvelope(struct{}{})
 }
 
-func routingConfigurationResponse(sourceFormat, message string) RequestInterceptResponse {
-	return RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseHeaders: http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}, ResponseBody: refusalBody(sourceFormat, refusal{anthropicType: "api_error", openaiType: "server_error", openaiCode: "routing_configuration_error"}, message)}
+func routingErrorResponse(sourceFormat, code, message string) RequestInterceptResponse {
+	return RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseHeaders: http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}, ResponseBody: refusalBody(sourceFormat, refusal{anthropicType: "api_error", openaiType: "server_error", openaiCode: code}, message)}
 }
 
 func (a *App) handleUsage(raw []byte) ([]byte, error) {
@@ -179,7 +225,7 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &record); errUnmarshal != nil {
 		return nil, fmt.Errorf("Parse usage record: %w", errUnmarshal)
 	}
-	if a == nil || a.store == nil || !a.store.Enabled() {
+	if !a.store.Enabled() {
 		return OKEnvelope(struct{}{})
 	}
 	scope := billing.CallerScope(record.APIKey)
@@ -189,14 +235,17 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	}
 	at := a.store.Now()
 	event := billing.UsageEvent{
+		RequestOrigin:       a.findRequestOrigin(record.TraceID, scope),
+		Execution:           record.executionMetadata(),
+		Stream:              record.Stream,
 		Scope:               scope,
 		KeyPreview:          billing.PreviewKey(record.APIKey),
 		AuthIndex:           record.AuthIndex,
 		Provider:            record.Provider,
 		ExecutorType:        record.ExecutorType,
 		AuthType:            record.AuthType,
-		QuotaHeaders:        usageQuotaHeaders(record, at),
-		Account:             record.Source,
+		Quota:               usageQuotaReport(record, at),
+		Account:             a.usageAccount(record),
 		ReasoningEffort:     record.ReasoningEffort,
 		ServiceTier:         record.ServiceTier,
 		ResponseServiceTier: record.ResponseServiceTier,
@@ -214,7 +263,7 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	} else {
 		a.store.RecordUsage(event)
 	}
-	a.observeCredentialUsage(record.AuthIndex, record.AuthType, record.Source, scope)
+	a.observeCredentialUsage(record.AuthIndex, record.AuthType, event.Account)
 	return OKEnvelope(struct{}{})
 }
 

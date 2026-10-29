@@ -1,19 +1,21 @@
 package billing
 
 import (
-	"net/http"
 	"strings"
 	"time"
 )
 
 type UsageEvent struct {
+	RequestOrigin
+	Execution           *ExecutionMetadata
+	Stream              *bool
 	Scope               string
 	KeyPreview          string
 	AuthIndex           string
 	Provider            string
 	ExecutorType        string
 	AuthType            string
-	QuotaHeaders        http.Header
+	Quota               *QuotaReport
 	Account             string
 	ReasoningEffort     string
 	ServiceTier         string
@@ -40,16 +42,6 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 	scope := strings.TrimSpace(event.Scope)
 	provider := strings.TrimSpace(event.Provider)
 	authType := strings.ToLower(strings.TrimSpace(event.AuthType))
-	account := ""
-	switch authType {
-	case "apikey":
-		account = PreviewKey(event.Account)
-	case "oauth":
-		// The host may fall back to the downstream API key when no account is available.
-		if CallerScope(event.Account) != normalizeScope(scope) {
-			account = strings.TrimSpace(event.Account)
-		}
-	}
 	at := event.At
 	if at.IsZero() {
 		at = s.Now()
@@ -61,7 +53,7 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 	if priceErr != nil || price.Source == PriceSourceNone {
 		// Usage has already happened. Keep all reported tokens and failure
 		// details even if its price was deleted or reference prices are unavailable.
-		price = Price{Source: PriceSourceNone}
+		price = Price{Source: PriceSourceNone, Currency: USD}
 	}
 
 	cost := ComputeCost(price, event.Breakdown)
@@ -71,16 +63,7 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 		if s.cfg.CodexFastModeBilling && price.Source != PriceSourceNone && event.Breakdown.Billable() &&
 			strings.EqualFold(provider, "codex") && authType == "oauth" &&
 			strings.EqualFold(strings.TrimSpace(event.ServiceTier), "priority") {
-			cost.Multiplier = CodexFastModeMultiplier
-			cost.UncachedInputUSD *= CodexFastModeMultiplier
-			cost.CacheReadUSD *= CodexFastModeMultiplier
-			cost.CacheWriteUSD *= CodexFastModeMultiplier
-			cost.OutputUSD *= CodexFastModeMultiplier
-			cost.TotalUSD = cost.UncachedInputUSD + cost.CacheReadUSD + cost.CacheWriteUSD + cost.OutputUSD
-			cost.AppliedInputPer1M *= CodexFastModeMultiplier
-			cost.AppliedOutputPer1M *= CodexFastModeMultiplier
-			cost.AppliedCacheReadPer1M *= CodexFastModeMultiplier
-			cost.AppliedCacheWritePer1M *= CodexFastModeMultiplier
+			cost.multiply(CodexFastModeMultiplier)
 		}
 		upstreamModel := strings.TrimSpace(event.UpstreamModel)
 		if upstreamModel == "" {
@@ -92,11 +75,14 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 			entryAt = at
 		}
 		entry := RequestEvent{
+			RequestOrigin:       event.RequestOrigin,
+			Execution:           event.Execution,
+			Stream:              event.Stream,
 			At:                  entryAt,
 			Scope:               scope,
 			AuthIndex:           event.AuthIndex,
 			Provider:            provider,
-			Account:             account,
+			Account:             event.Account,
 			ExecutorType:        event.ExecutorType,
 			ReasoningEffort:     event.ReasoningEffort,
 			ServiceTier:         event.ServiceTier,
@@ -111,11 +97,11 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 			PriceSource:         price.Source,
 			Cost:                cost,
 			ReasoningTokens:     event.Breakdown.Output.ReasoningTokens,
-			QuotaHeaders:        event.QuotaHeaders,
+			Quota:               event.Quota,
 		}
 		var changedKeys []string
 		if key := state.ensureKey(scope, event.KeyPreview); key != nil {
-			usage := quotaUsage{AmountUSD: cost.TotalUSD}
+			usage := quotaUsage{Spending: spent(cost.Total, cost.Currency)}
 			if !failed {
 				usage.Requests = 1
 			}
@@ -124,9 +110,7 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 			}
 			missingCycleTime = event.RequestedAt.IsZero() && len(key.Cycles) > 0 && usage != (quotaUsage{})
 			key.chargeCycles(event.RequestedAt, usage)
-			if _, hasPlan := state.FindPlan(key.PlanID); hasPlan {
-				settleExpiredCycles(key, at)
-			}
+			settleExpiredCycles(key, at)
 			changedKeys = []string{scope}
 		}
 		changes := Changes{
@@ -146,7 +130,7 @@ func (s *Store) recordUsage(event UsageEvent, failure *RequestError) {
 	if price.Source == PriceSourceReference {
 		s.AddPluginLog(PluginLogDebug,
 			"Reference pricing: billing_model=%q, cost=$%.8f, rates per million tokens: input=$%g, output=$%g, cache_read=$%g, cache_write=$%g",
-			billingModel, cost.TotalUSD, cost.AppliedInputPer1M, cost.AppliedOutputPer1M,
+			billingModel, cost.Total, cost.AppliedInputPer1M, cost.AppliedOutputPer1M,
 			cost.AppliedCacheReadPer1M, cost.AppliedCacheWritePer1M)
 	}
 }

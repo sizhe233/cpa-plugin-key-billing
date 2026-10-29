@@ -8,6 +8,17 @@ const EVENT_CSV_COLUMNS = {
     "billing_model",
     "upstream_model",
     "executor_type",
+    "request_id",
+    "trace_id",
+    "session_id",
+    "parent_session_id",
+    "access_provider",
+    "is_native_key",
+    "base_url",
+    "credential_ref",
+    "endpoint",
+    "transport",
+    "stream",
     "source",
     "reasoning_effort",
     "service_tier",
@@ -22,7 +33,10 @@ const EVENT_CSV_COLUMNS = {
     "cache_read_tokens",
     "cache_write_tokens",
     "multiplier",
-    "total_usd"
+    "currency",
+    "cost",
+    "user_agent",
+    "x_forwarded_for"
   ],
   errors: ["at", "preview", "label", "billing_model", "upstream_model", "source", "status_code", "error_type", "body"]
 };
@@ -31,47 +45,6 @@ function apiKeyFilter(account) {
   const key = account ? "" : $("analysis-key").value;
   if (!key) return {};
   return key === UNASSIGNED_KEY ? { api_key_empty: "true" } : { api_key: key };
-}
-
-function requestEventFilters(account) {
-  const prefix = account ? "account-request-event" : "request-event";
-  const filters = apiKeyFilter(account);
-  for (const [field, control] of [["model", "model"], ["source", "source"], ["failed", "status"]]) {
-    const value = $(prefix + "-" + control).value;
-    if (value) filters[field] = value;
-  }
-  return filters;
-}
-
-function errorEventFilters(account) {
-  const prefix = account ? "account-" : "";
-  const filters = apiKeyFilter(account);
-  for (const field of ["model", "source"]) {
-    const value = $(prefix + "error-" + field).value;
-    if (value) filters[field] = value;
-  }
-  const typeChoice = $(prefix + "error-type").value;
-  if (typeChoice) {
-    const errorType = typeChoice.slice(5);
-    if (errorType) filters.error_type = errorType; else filters.error_type_empty = "true";
-  }
-  return filters;
-}
-
-const REQUEST_EVENT_STATUS_OPTIONS = {
-  "": { label: m("ui.all_results"), count: "all" },
-  false: { label: m("ui.succeeded"), count: "normal" },
-  true: { label: m("ui.failed"), count: "failed" }
-};
-
-// Counts cover the whole field/time selection and ignore the status choice,
-// so each status option can show how many entries selecting it would reveal.
-function labelRequestEventStatuses(select, counts) {
-  for (const option of select.options) {
-    const status = REQUEST_EVENT_STATUS_OPTIONS[option.value];
-    const label = status.label + DISPLAY_SEPARATOR + int((counts || {})[status.count]);
-    if (option.textContent !== label) setText(option, label);
-  }
 }
 
 function renderSelectOptions(select, options) {
@@ -128,20 +101,13 @@ function disambiguateSourceFilterOptions(options) {
   });
 }
 
-function populateRequestEventFilters(filters, account) {
-  if (!filters) return;
-  const prefix = account ? "account-request-event" : "request-event";
-  populateEventFilterSelect($(prefix + "-model"), m("ui.all_models"), filters.models);
-  populateSourceFilterSelect($(prefix + "-source"), filters);
-}
-
 function readEventKeys(reload) {
   const range = selectedRange(false);
   return eventKeysQuery.read(
     JSON.stringify(sharedTimeRanges.admin),
     async () => {
       const revision = keyDirectory.beginRead();
-      const keys = requireArray(await plugin("GET", "/events/keys?" + new URLSearchParams(range)), m("ui.event_api_keys"));
+      const keys = await plugin("GET", "/events/keys?" + new URLSearchParams(range));
       return keyDirectory.receive(keys, revision);
     },
     reload
@@ -196,293 +162,15 @@ function bindPagedListFilters(list, role, ids, clear) {
   };
 }
 
-function failureTag(entry) {
-  const body = entry.failed ? entry.error_body : "";
-  const content = () => [el("pre", { class: "hover-tooltip-body mono", text: body })];
-  return el("span", {
-    class: "tag " + (entry.failed ? "bad" : "ok"),
-    text: entry.failed ? m("ui.failed") : m("ui.succeeded"),
-    ...hoverTooltipProps(content, body)
-  });
-}
-
-function renderRequestEvents(account = false) {
-  closeHoverTooltip();
-  const list = pagedList("events", account);
-  const note = $(account ? "account-request-event-note" : "request-event-note");
-  if (list.renderEmpty()) {
-    setText(note, "");
-    return;
-  }
-  const view = list.data;
-  const prefix = account ? "account-request-event" : "request-event";
-  populateRequestEventFilters(view.filter_options, account);
-  labelRequestEventStatuses($(prefix + "-status"), view.status_counts);
-  updateFilterClearButton($(account ? "account-request-events-filter-clear" : "request-events-filter-clear"));
-  const entries = view.entries;
-  const hasCacheWrite = entries.some((entry) => entry.cost.cache_write_tokens !== 0);
-  setText(note, loadedCountText(entries.length, view.total, list.complete));
-  const renderRow = (entry) => {
-    const cost = entry.cost;
-    const costNote = [
-      cost.tiered ? (cost.long_context ? m("ui.long_context") : m("ui.standard")) : "",
-      cost.multiplier === 2.5 ? "x2.5" : ""
-    ]
-      .filter(Boolean)
-      .join(DISPLAY_SEPARATOR);
-    const input = requestInputTokens(cost);
-    const output = cost.billed_output_tokens;
-    // Missing usage details mean unknown counts, not zero usage.
-    const measured = entry.accounting_quality === "complete";
-    const tps = outputTPS(cost, entry.latency_ms, measured);
-    const tokens = (value) => (measured ? exactTokens(value) : "—");
-    const hasTTFT = Number(entry.ttft_ms || 0) > 0;
-
-    const billingModel = entry.billing_model || entry.upstream_model || "—";
-    const upstreamModel = entry.upstream_model || "—";
-    const showUpstreamModel = entry.upstream_model && entry.upstream_model !== billingModel;
-    const mismatchedModel = entry.response_model && entry.response_model !== entry.upstream_model ? entry.response_model : "";
-    const mismatchLabel = m("ui.upstream_served_a_model_other_than_the_one_requested");
-    const serviceTiers = [entry.service_tier, entry.response_service_tier].filter(Boolean).join("\u2009/\u2009") || "—";
-    const modelNote = mismatchedModel
-      ? el(
-          "div",
-          { class: "request-event-cell-line muted" },
-          actionIcon("corner-down-right"),
-          mismatchedModel,
-          el(
-            "span",
-            {
-              class: "tag warn icon",
-              role: "img",
-              "aria-label": mismatchLabel,
-              ...hoverTooltipProps(() => [el("div", { class: "hover-tooltip-body", text: mismatchLabel })], true)
-            },
-            actionIcon("equal-not")
-          )
-        )
-      : showUpstreamModel ? el("div", { class: "request-event-cell-line muted" }, actionIcon("move-right"), upstreamModel) : null;
-
-    return el(
-      "tr",
-      {},
-      el("td", {}, dateTimeLines(entry.at)),
-      account ? null : el("td", {}, renderAPIKeyIdentity(entry, { stacked: true })),
-      el("td", { class: "small" }, el("div", { class: "request-event-cell-line mono" }, billingModel), modelNote),
-      el(
-        "td",
-        { class: "small" },
-        el("div", { class: "request-event-cell-line mono" }, entry.executor_type || m("ui.unknown_executor")),
-        el(
-          "div",
-          { class: "request-event-source muted", "data-tip": displayLabel(entry.source) || null, "data-tip-overflow": "" },
-          entry.source ? maskedLabelText(entry.source) : m("ui.unknown_source")
-        )
-      ),
-      el(
-        "td",
-        { class: "small" },
-        el("div", { class: "request-event-cell-line mono" }, entry.reasoning_effort || "—"),
-        el("div", { class: "request-event-cell-line muted" }, serviceTiers)
-      ),
-      el("td", {}, failureTag(entry)),
-      el(
-        "td",
-        { class: "num" },
-        el("div", {}, tps === null ? "—" : tps.toFixed(1) + " t/s"),
-        el(
-          "div",
-          {
-            class: "muted small",
-            "data-tip": hasTTFT ? m("ui.time_to_first_tokenvaluetotal_latency", { v0: DISPLAY_SEPARATOR }) : m("ui.total_latency")
-          },
-          hasTTFT ? latency(entry.ttft_ms) + DISPLAY_SEPARATOR + latency(entry.latency_ms) : latency(entry.latency_ms)
-        )
-      ),
-      el("td", { class: "num" }, tokens(input)),
-      el(
-        "td",
-        { class: "num" },
-        el("div", {}, tokens(cost.cache_read_tokens)),
-        measured ? el("div", { class: "muted small" }, cacheReadRate(cost.cache_read_tokens, input)) : null
-      ),
-      hasCacheWrite ? el("td", { class: "num" }, tokens(cost.cache_write_tokens)) : null,
-      el(
-        "td",
-        { class: "num" },
-        el("div", {}, tokens(output)),
-        measured && entry.reasoning_tokens
-          ? el("div", { class: "muted small" }, m("ui.reasoning_value", { v0: exactTokens(entry.reasoning_tokens) }))
-          : null
-      ),
-      el(
-        "td",
-        { class: "num" },
-        el(
-          "div",
-          {},
-          measured
-            ? el(
-                "span",
-                {
-                  class: "cost-value",
-                  tabindex: "0",
-                  "aria-label": m("ui.view_cost_breakdown"),
-                  ...hoverTooltipProps(() => renderCostTooltip(cost, hasCacheWrite))
-                },
-                usd(cost.total_usd)
-              )
-            : usd(cost.total_usd)
-        ),
-        costNote ? el("div", { class: "muted small" }, costNote) : null
-      )
-    );
-  };
-
-  list.renderItems(entries, {
-    render: renderRow,
-    headers: [
-      m("ui.time"),
-      ...(account ? [] : ["API Key"]),
-      m("ui.model"),
-      m("ui.executor_source"),
-      m("ui.reasoning_speed"),
-      m("ui.result"),
-      { label: m("ui.tps_latency"), num: true },
-      { label: m("ui.input"), num: true },
-      { label: m("ui.cache_read"), num: true },
-      ...(hasCacheWrite ? [{ label: m("ui.cache_write"), num: true }] : []),
-      { label: m("ui.output"), num: true },
-      { label: m("ui.cost"), num: true }
-    ]
-  });
-}
-
-function costTierText(cost) {
-  const threshold = tokenThreshold(cost.threshold_input_tokens);
-  return cost.long_context ? m("ui.long_context_value", { v0: threshold }) : m("ui.standard_context_value", { v0: threshold });
-}
-
-function renderCostTooltip(cost, hasCacheWrite) {
-  const rows = [
-    [m("ui.uncached_input"), cost.uncached_input_tokens, cost.applied_input_per_1m, cost.uncached_input_usd],
-    [m("ui.cache_read"), cost.cache_read_tokens, cost.applied_cache_read_per_1m, cost.cache_read_usd],
-    ...(hasCacheWrite ? [[m("ui.cache_write"), cost.cache_write_tokens, cost.applied_cache_write_per_1m, cost.cache_write_usd]] : []),
-    [m("ui.output"), cost.billed_output_tokens, cost.applied_output_per_1m, cost.output_usd]
-  ];
-  return [
-    el("div", { class: "cost-tooltip-title", text: m("ui.cost_breakdown") }),
-    ...(cost.tiered ? [el("div", { class: "cost-tooltip-summary" }, el("span", {}, m("ui.tier")), el("b", {}, costTierText(cost)))] : []),
-    ...(cost.multiplier === 2.5
-      ? [
-          el(
-            "div",
-            { class: "cost-tooltip-summary" },
-            el("span", {}, m("ui.billing_multiplier")),
-            el("b", {}, "2.5×" + DISPLAY_SEPARATOR, m("ui.codex_fast_mode"))
-          ),
-          el("div", { class: "cost-tooltip-summary" }, m("ui.the_prices_and_amounts_below_include_the_multiplier"))
-        ]
-      : []),
-    el(
-      "div",
-      { class: "cost-tooltip-grid" },
-      el("span", { class: "cost-tooltip-head" }, m("ui.item")),
-      el("span", { class: "cost-tooltip-head num" }, m("ui.tokens_unit_price")),
-      el("span", { class: "cost-tooltip-head num" }, m("ui.amount")),
-      rows.flatMap(([name, tokenCount, price, amount]) => [
-        el("span", {}, name),
-        el("span", { class: "num" }, exactTokens(tokenCount) + " × " + usd(price) + DISPLAY_SLASH + "1M"),
-        el("span", { class: "num" }, usd(amount))
-      ])
-    ),
-    el("div", { class: "cost-tooltip-total" }, el("span", {}, m("ui.total_amount")), el("span", {}, usd(cost.total_usd)))
-  ];
-}
-
-function populateErrorFilters(view, account) {
-  const prefix = account ? "account-" : "";
-  const filters = view.filter_options || {};
-  const counts = view.error_type_counts || {};
-  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
-  const typeSelect = $(prefix + "error-type");
-  const types = Object.keys(counts);
-  if (typeSelect.value) types.push(typeSelect.value.slice(5));
-  populateEventFilterSelect(
-    typeSelect,
-    m("ui.all_error_typesvaluevalue", { v0: DISPLAY_SEPARATOR, v1: int(total) }),
-    [...new Set(types)].sort(),
-    (value) => "type:" + value,
-    (value) => (value || m("ui.uncategorized")) + DISPLAY_SEPARATOR + int(counts[value])
-  );
-  populateEventFilterSelect($(prefix + "error-model"), m("ui.all_models"), filters.models);
-  populateSourceFilterSelect($(prefix + "error-source"), filters);
-}
-
-function renderErrors(account) {
-  const note = $(account ? "account-error-note" : "error-note");
-  const list = pagedList("errors", account);
-  if (list.renderEmpty()) {
-    setText(note, "");
-    return;
-  }
-  const view = list.data;
-  populateErrorFilters(view, account);
-  updateFilterClearButton($(account ? "account-errors-filter-clear" : "errors-filter-clear"));
-  list.renderItems(view.entries, {
-    attrs: { class: "event-list", role: "list", "aria-label": m("ui.error_event_list") },
-    empty: m("ui.no_error_events"),
-    render: (entry) => {
-      const tags = [el("span", { class: "tag bad", text: entry.status_code ? "HTTP " + entry.status_code : m("ui.failed") })];
-      if (entry.error_type) { tags.push(el("span", { class: "tag bad", text: entry.error_type })); }
-      return el(
-        "article",
-        { class: "event-entry request-failure", role: "listitem" },
-        el(
-          "div",
-          { class: "event-entry-head" },
-          el("time", { class: "event-time", datetime: entry.at || null }, when(entry.at)),
-          el(
-            "div",
-            { class: "event-request-meta" },
-            account ? null : errorEventField("API Key", maskedText(apiKeyIdentity(entry).text), false),
-            errorEventField(m("ui.model"), entry.billing_model || entry.upstream_model),
-            entry.source ? errorEventField(m("ui.source"), maskedLabelText(entry.source)) : null
-          ),
-          el("div", { class: "event-entry-tags" }, tags)
-        ),
-        el("pre", { class: "event-error-body mono", text: entry.body || m("ui.no_error_details") })
-      );
-    }
-  });
-  setText(note, loadedCountText(view.entries.length, view.total, list.complete));
-}
-
-function errorEventField(label, value, mono = true) {
-  if (!value) return null;
-  return el(
-    "div",
-    { class: "error-event-field" },
-    el("span", { class: "error-event-field-label", text: label }),
-    el(
-      "span",
-      {
-        class: "error-event-field-value" + (mono ? " mono" : ""),
-        "data-tip": typeof value === "string" ? displayLabel(value) : null,
-        "data-tip-overflow": ""
-      },
-      displayText(value)
-    )
-  );
-}
-
 function csvCell(value) {
   if (value === undefined || value === null) return "";
   return '"' + String(value).replaceAll('"', '""') + '"';
 }
 
 function eventCSV(entries, kind, account) {
-  const columns = EVENT_CSV_COLUMNS[kind].filter((column) => !account || !["preview", "label"].includes(column));
+  const columns = EVENT_CSV_COLUMNS[kind].filter(
+    (column) => !account || !["preview", "label", "base_url", "credential_ref"].includes(column)
+  );
   const lines = [columns.map(csvCell).join(",")];
   for (const record of entries) {
     const entry = account ? record : keyDirectory.resolve(record);
@@ -492,7 +180,9 @@ function eventCSV(entries, kind, account) {
         ? {
             ...entry,
             ...entry.cost,
+            ...entry.execution,
             multiplier: entry.cost.multiplier || 1,
+            cost: entry.cost.total,
             input_tokens: requestInputTokens(entry.cost),
             output_tps: outputTPS(entry.cost, entry.latency_ms, measured)
           }

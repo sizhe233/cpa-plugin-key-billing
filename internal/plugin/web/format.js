@@ -1,14 +1,54 @@
-function usd(value) {
+const CURRENCY_SYMBOLS = { USD: "$", CNY: "¥" };
+
+function currencyOptions() { return Object.keys(CURRENCY_SYMBOLS).map((code) => el("option", { value: code, text: code })); }
+
+function money(value, currency, fixedDigits) {
+  const symbol = CURRENCY_SYMBOLS[currency];
   const amount = Number(value || 0);
-  if (amount === 0) return "$0";
   const absolute = Math.abs(amount);
-  const digits = absolute >= 1 ? 2 : absolute >= 0.01 ? 4 : 6;
-  const compact = amount.toLocaleString("en-US", { maximumFractionDigits: digits });
+  const digits = fixedDigits ?? (absolute >= 1 ? 2 : absolute >= 0.01 ? 4 : 6);
+  const compact = amount.toLocaleString("en-US", { minimumFractionDigits: fixedDigits ?? 0, maximumFractionDigits: digits });
+  if (amount === 0 || fixedDigits !== undefined) return symbol + compact;
   const rounded = Number(compact.replaceAll(",", ""));
-  if (rounded === 0) return "<$0.000001";
+  if (rounded === 0) return "<" + symbol + "0.000001";
   const tolerance = Number.EPSILON * Math.max(1, absolute) * 8;
-  if (Math.abs(amount - rounded) <= tolerance) return "$" + compact;
-  return "$" + amount.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  if (Math.abs(amount - rounded) <= tolerance) return symbol + compact;
+  return symbol + amount.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function moneyChoice() {
+  const account = currentRole === "account";
+  return {
+    selected: $((account ? "account-" : "") + "display-currency").value,
+    rate: resources[account ? "account" : "admin"].currency.value?.cny_per_usd
+  };
+}
+
+// Renders compare this key to know when displayed amounts change.
+function moneyDisplayKey() {
+  const { selected, rate } = moneyChoice();
+  return selected + ":" + (rate || "");
+}
+
+// Amounts show in the selected currency, or under Auto in the one they were
+// charged in, and in USD for a mix. Converting waits for the rate.
+function displayMoney(amount, from, chargedIn, fixedDigits) {
+  const { selected, rate } = moneyChoice();
+  const target = selected === "auto" ? (chargedIn === "CNY" ? "CNY" : "USD") : selected;
+  const value = Number(amount || 0);
+  if (target === from || !rate) return money(value, from, fixedDigits);
+  return money(target === "CNY" ? value * rate : value / rate, target, fixedDigits);
+}
+
+// Usage totals arrive in USD with the one currency they were charged in, if any.
+function usageMoney(valueUSD, chargedIn, fixedDigits) { return displayMoney(valueUSD, "USD", chargedIn, fixedDigits); }
+
+// A request's cost and rates are in the currency of its price.
+function costMoney(amount, currency, fixedDigits) { return displayMoney(amount, currency, currency, fixedDigits); }
+
+function commonChargedIn(totals) {
+  const currencies = new Set(totals.filter((total) => total.cost_usd > 0).map((total) => total.charged_in || ""));
+  return currencies.size === 1 ? [...currencies][0] : "";
 }
 
 function loadedCountText(loaded, total, complete) {
@@ -32,10 +72,12 @@ function quotaTokens(n) {
 function exactTokens(value) { return Math.trunc(Number(value || 0)).toLocaleString("en-US"); }
 function latency(value) {
   const milliseconds = Number(value || 0);
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "—";
+  if (milliseconds <= 0) return "—";
   if (milliseconds < 1000) return Math.round(milliseconds) + " ms";
   return (milliseconds / 1000).toFixed(2) + " s";
 }
+function tokenRate(value) { return value.toFixed(1) + " t/s"; }
+function tokenRateRange(from, to) { return from.toFixed(1) + "–" + tokenRate(to); }
 function outputTPS(cost, latencyMS, measured) { return measured && latencyMS > 0 ? (cost.billed_output_tokens * 1000) / latencyMS : null; }
 function requestInputTokens(cost) { return cost.uncached_input_tokens + cost.cache_read_tokens + cost.cache_write_tokens; }
 function cacheReadRate(cacheRead, totalInput) {
@@ -73,11 +115,11 @@ function compactResetDate(date) {
   return pad(date.getMonth() + 1) + "/" + pad(date.getDate()) + " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
 }
 
-function compactResetAfter(seconds) {
-  if (seconds < 60) return m("ui.in_less_than_a_minute");
-  if (seconds >= 86400) return m("time.in_day", { count: Math.floor(seconds / 86400) });
-  if (seconds >= 3600) return m("time.in_hour", { count: Math.floor(seconds / 3600) });
-  return m("time.in_minute", { count: Math.floor(seconds / 60) });
+// Time until a moment in its largest whole unit, as "in 3 hours" or, with the left form, "3 hours left".
+function compactTimeUntil(seconds, form = "in") {
+  if (seconds < 60) return m(form === "left" ? "ui.less_than_a_minute_left" : "ui.in_less_than_a_minute");
+  const [unit, size] = seconds >= 86400 ? ["day", 86400] : seconds >= 3600 ? ["hour", 3600] : ["minute", 60];
+  return m("time." + form + "_" + unit, { count: Math.floor(seconds / size) });
 }
 
 function previewCredential(value) {
@@ -106,7 +148,9 @@ function maskedTailText(provider, account) {
   return [provider, el("span", { class: "text-separator", text: DISPLAY_SEPARATOR }), maskedText(account)];
 }
 
-function maskedText(value) { return el("span", { class: "mask-blur" }, displayText(value)); }
+function maskedText(value) {
+  return window.billingI18n.isMessage(value) ? displayText(value) : el("span", { class: "mask-blur" }, displayText(value));
+}
 
 function splitCredentialLabel(value) {
   const label = displayLabel(value);
@@ -138,7 +182,7 @@ function renderAPIKeyIdentity(view, options = {}) {
   const line = (text, className, children = []) => el("span", { class: "api-key-identity-line" + className }, maskedText(text), children);
   return el(
     "span",
-    { class: "api-key-identity" + (options.stacked ? " api-key-identity-stacked" : ""), "data-tip": identity.text },
+    { class: "api-key-identity" + (options.stacked ? " api-key-identity-stacked" : "") },
     line(identity.primary, "", identity.secondary ? [] : trailing),
     identity.secondary ? line(identity.secondary, " api-key-identity-secondary", trailing) : null
   );

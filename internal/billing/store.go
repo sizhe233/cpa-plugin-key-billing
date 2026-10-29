@@ -26,15 +26,17 @@ type Store struct {
 	path  string
 	dirty Changes
 
-	// activeRequests and activeByScope are the process-local concurrency slots.
-	// Only the configured limit is persisted: active requests end with this host
-	// process and are correlated exactly by the host-provided request ID.
-	activeRequests map[string]string
+	// Process-local slots keyed by CPA's execution ID; only limits are persisted.
+	activeRequests map[string]concurrencySlot
 	activeByScope  map[string]int
 
 	// blocked remembers which keys have already had their exhausted quota
 	// reported, so retries against one do not repeat it.
 	blocked blockedKeys
+
+	// configOrder is each key's position in the list CPA last synced. It is not
+	// persisted: the admin UI syncs that list before it reads the keys.
+	configOrder map[string]int
 
 	errMu     sync.Mutex
 	lastError string
@@ -47,12 +49,14 @@ type Store struct {
 
 func NewStore(open func(string) (Repository, error), downloadReferencePrices func(context.Context) ([]byte, error)) *Store {
 	if downloadReferencePrices == nil {
-		downloadReferencePrices = downloadModelsDevPrices
+		downloadReferencePrices = func(context.Context) ([]byte, error) {
+			return nil, fmt.Errorf("Reference price downloader is unavailable")
+		}
 	}
 	return &Store{
 		state:                   NewState(),
 		cfg:                     DefaultConfig(),
-		activeRequests:          make(map[string]string),
+		activeRequests:          make(map[string]concurrencySlot),
 		activeByScope:           make(map[string]int),
 		open:                    open,
 		downloadReferencePrices: downloadReferencePrices,
@@ -67,7 +71,10 @@ func (s *Store) Now() time.Time {
 // The host invokes Configure on every plugin.reconfigure, so repeated calls
 // must be safe.
 func (s *Store) Configure(cfg Config) error {
-	normalized := cfg.normalized()
+	normalized, err := cfg.normalized()
+	if err != nil {
+		return err
+	}
 	path, err := filepath.Abs(normalized.StateFile)
 	if err != nil {
 		return fmt.Errorf("Resolve billing database path %q: %w", normalized.StateFile, err)
@@ -136,7 +143,7 @@ func (s *Store) Close() {
 	s.repo = nil
 	s.path = ""
 	s.dirty = Changes{}
-	s.activeRequests = make(map[string]string)
+	s.activeRequests = make(map[string]concurrencySlot)
 	s.activeByScope = make(map[string]int)
 	s.mu.Unlock()
 	previousReferences.close()
@@ -159,16 +166,10 @@ func (s *Store) Enabled() bool {
 	return s.cfg.Enabled
 }
 
-func (s *Store) MaskAPIKeyViewEmails() bool {
+func (s *Store) Config() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cfg.MaskAPIKeyViewEmails
-}
-
-func (s *Store) AllowAPIKeyQuotaReset() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cfg.AllowAPIKeyQuotaReset
+	return s.cfg
 }
 
 func (s *Store) read(fn func(*State)) {

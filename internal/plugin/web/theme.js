@@ -3,10 +3,11 @@ function panelStoredValue(name) {
   try {
     let raw = localStorage.getItem(name);
     if (!raw) return null;
-    const prefix = "enc::v1::";
-    if (raw.startsWith(prefix)) {
-      const secret = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + location.host + "|" + navigator.userAgent);
-      const binary = atob(raw.slice(prefix.length));
+    const prefix = /^enc::v([12])::/.exec(raw);
+    if (prefix) {
+      const scope = prefix[1] === "2" ? "v2|" + location.host : location.host + "|" + navigator.userAgent;
+      const secret = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + scope);
+      const binary = atob(raw.slice(prefix[0].length));
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) ^ secret[i % secret.length];
       raw = new TextDecoder().decode(bytes);
@@ -80,14 +81,12 @@ function panelStoredValue(name) {
   window.billingTheme = {
     current: () => appliedTheme,
     preference: () => selectedTheme,
-    cycle() {
-      const order = ["", "white", "dark"];
-      selectedTheme = order[(order.indexOf(selectedTheme) + 1) % order.length];
+    select(value) {
+      selectedTheme = value;
       try {
         if (selectedTheme) localStorage.setItem(PLUGIN_STORE_KEY, selectedTheme); else localStorage.removeItem(PLUGIN_STORE_KEY);
       } catch (_) {}
       sync();
-      return selectedTheme;
     }
   };
 })();

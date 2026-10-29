@@ -37,7 +37,7 @@ func TestV12PriceMigrationPreservesModelIDsAndHistory(t *testing.T) {
 			if err := legacy.Close(); err != nil {
 				t.Fatal(err)
 			}
-			database, err := Open(path)
+			database, err := Open(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -117,7 +117,7 @@ VALUES('legacy-scope','plan',4.5,'[{"kind":"model","value":"model-a"}]');`
 				if _, err := raw.Exec(old); err != nil {
 					t.Fatal(err)
 				}
-				d, err := Open(path)
+				d, err := Open(path, nil)
 				if conflict != "" {
 					if err == nil {
 						d.Close()
@@ -161,12 +161,12 @@ VALUES('legacy-scope','plan',4.5,'[{"kind":"model","value":"model-a"}]');`
 				}
 				converted, _ := snapshot.State.FindPlan("legacy-zero")
 				cycle := snapshot.State.Keys["zero-active"].Cycles["default"]
-				if converted.Windows[0].PeriodSeconds != 365*24*3600 || cycle.SpentUSD != 2 ||
+				if converted.Windows[0].PeriodSeconds != 365*24*3600 || cycle.Spending.USD != 2 ||
 					!cycle.EndAt.Equal(time.Unix(0, 123456789).Add(365*24*time.Hour)) || len(snapshot.State.Keys["zero-idle"].Cycles) != 0 {
 					t.Fatal("zero-period migration changed consumption or started an idle window")
 				}
 				key := snapshot.State.Keys["legacy-scope"]
-				if key == nil || key.Cycles["default"].SpentUSD != 4.5 || (len(key.RouteBindings.Models) == 0 && len(key.RouteBindings.RouteIDs) == 0) {
+				if key == nil || key.Cycles["default"].Spending.USD != 4.5 || (len(key.RouteBindings.Models) == 0 && len(key.RouteBindings.RouteIDs) == 0) {
 					t.Fatal("legacy key state was lost", key)
 				}
 				var status int
@@ -184,9 +184,9 @@ VALUES('legacy-scope','plan',4.5,'[{"kind":"model","value":"model-a"}]');`
 // fresh database, including the absence of any derived alias table.
 func assertMigratedSchema(t *testing.T, migrated *DB) {
 	t.Helper()
-	var missingHeaders int
-	if err := migrated.db.QueryRow("SELECT count(*) FROM request_events WHERE response_headers_json != '{}' OR response_headers_json IS NULL").Scan(&missingHeaders); err != nil || missingHeaders != 0 {
-		t.Fatal("historical response headers must remain unreported", missingHeaders, err)
+	var reports int
+	if err := migrated.db.QueryRow("SELECT count(*) FROM quota_reports").Scan(&reports); err != nil || reports != 0 {
+		t.Fatal("historical quota must remain unreported", reports, err)
 	}
 	fresh := openTestDB(t)
 	readSchema := func(database *DB) string {
@@ -365,7 +365,7 @@ func TestV13CredentialMigrationAndRollback(t *testing.T) {
 			` + scenario.sql); err != nil {
 				t.Fatal(err)
 			}
-			database, err := Open(path)
+			database, err := Open(path, nil)
 			if scenario.sql != "" {
 				if err == nil {
 					database.Close()
@@ -424,7 +424,7 @@ func TestV13CredentialMigrationAndRollback(t *testing.T) {
 					t.Fatalf("migrated event = %+v", row)
 				}
 			}
-			if view.Entries[2].Cost.TotalUSD != 2.5 || view.Entries[1].Cost.TotalUSD != 0 || view.Entries[0].Cost.TotalUSD != 0 {
+			if view.Entries[2].Cost.Total != 2.5 || view.Entries[1].Cost.Total != 0 || view.Entries[0].Cost.Total != 0 {
 				t.Fatal("historical costs changed")
 			}
 			errors, err := database.RequestErrors(billing.RequestErrorQuery{}, time.Time{})
@@ -472,7 +472,7 @@ func TestV12QuotaWindowsMigrationAndRollback(t *testing.T) {
 			if _, err := raw.Exec("PRAGMA user_version=12"); err != nil {
 				t.Fatal(err)
 			}
-			database, err := Open(path)
+			database, err := Open(path, nil)
 			if scenario == "missing cycle time" || scenario == "mixed format" {
 				if err == nil {
 					database.Close()
@@ -500,11 +500,11 @@ func TestV12QuotaWindowsMigrationAndRollback(t *testing.T) {
 			if snapshot.State.Plans[0].Windows[0].PeriodSeconds != expectedPeriod {
 				t.Fatal("incorrect migrated period")
 			}
-			if !cycle.StartAt.Equal(start) || !cycle.EndAt.Equal(start.Add(time.Duration(expectedPeriod)*time.Second)) || cycle.SpentUSD != 7.5 || snapshot.RequestEventCount != 2 || snapshot.State.Keys["s"].DeletedAt.IsZero() {
+			if !cycle.StartAt.Equal(start) || !cycle.EndAt.Equal(start.Add(time.Duration(expectedPeriod)*time.Second)) || cycle.Spending.USD != 7.5 || snapshot.RequestEventCount != 2 || snapshot.State.Keys["s"].DeletedAt.IsZero() {
 				t.Fatalf("migration lost state: %+v", snapshot)
 			}
 			database.Close()
-			reopened, err := Open(path)
+			reopened, err := Open(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -513,8 +513,8 @@ func TestV12QuotaWindowsMigrationAndRollback(t *testing.T) {
 	}
 }
 
-func TestResponseHeadersMigrationAndRollback(t *testing.T) {
-	for _, version := range []int{12, 13, 14} {
+func TestRequestEventMetadataMigrationAndRollback(t *testing.T) {
+	for _, version := range []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23} {
 		for _, conflict := range []bool{false, true} {
 			t.Run(fmt.Sprintf("v%d/conflict=%v", version, conflict), func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "legacy.db")
@@ -528,16 +528,22 @@ func TestResponseHeadersMigrationAndRollback(t *testing.T) {
 				}
 				fixture := &DB{db: raw}
 				if err := fixture.transact(func(tx *sql.Tx) error {
-					if version >= 13 {
-						if err := migrateModelPricing(tx); err != nil {
-							return err
+					for _, step := range []struct {
+						version int
+						apply   func(*sql.Tx) error
+					}{
+						{13, migrateModelPricing}, {13, migrateQuotaWindows},
+						{14, migrateCredentials}, {15, migrateResponseHeaders},
+						{16, migrateRequestErrorReason}, {17, migrateUpstreamResponseReports},
+						{18, migrateRequestInfo}, {19, migrateExecutionMetadata},
+						{20, func(tx *sql.Tx) error { return migrateQuotaReports(tx, nil) }},
+						{21, migrateClientHeaders}, {22, migrateConfiguredProviders}, {23, migrateCredentialNotes},
+					} {
+						if version >= step.version {
+							if err := step.apply(tx); err != nil {
+								return err
+							}
 						}
-						if err := migrateQuotaWindows(tx); err != nil {
-							return err
-						}
-					}
-					if version >= 14 {
-						return migrateCredentials(tx)
 					}
 					return nil
 				}); err != nil {
@@ -549,12 +555,23 @@ func TestResponseHeadersMigrationAndRollback(t *testing.T) {
 					INSERT INTO request_errors(request_event_id,status_code,body) VALUES(2,502,'preserved failure');`); err != nil {
 					t.Fatal(err)
 				}
-				if version == 14 {
+				if version >= 13 {
+					// Schemas 13 to 23 stored window amounts in USD as amount_usd.
+					if _, err := raw.Exec(`INSERT INTO plans(position,id,name,windows_json)
+						VALUES(0,'stored','Stored','[{"id":"w","name":"额度","period_seconds":3600,"amount_usd":2.5}]')`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if version >= 14 {
 					if _, err := raw.Exec(`CREATE TRIGGER reject_update BEFORE UPDATE ON request_events BEGIN SELECT RAISE(ABORT,'history rewritten'); END;
 						CREATE TRIGGER reject_delete BEFORE DELETE ON request_events BEGIN SELECT RAISE(ABORT,'history deleted'); END;`); err != nil {
 						t.Fatal(err)
 					}
+					if _, err := raw.Exec(`INSERT INTO config_credentials(ref,provider,key_preview,disabled) VALUES('saved','codex','sk-dum…1234',1)`); err != nil {
+						t.Fatal(err)
+					}
 				}
+
 				if conflict {
 					// Fail after adding the column, during index synchronization.
 					if _, err := raw.Exec("DROP INDEX request_events_at; CREATE TABLE request_events_at(marker TEXT)"); err != nil {
@@ -566,7 +583,7 @@ func TestResponseHeadersMigrationAndRollback(t *testing.T) {
 				if err := raw.QueryRow(schemaSQL).Scan(&before); err != nil {
 					t.Fatal(err)
 				}
-				database, err := Open(path)
+				database, err := Open(path, nil)
 				if conflict {
 					if err == nil {
 						database.Close()
@@ -580,15 +597,38 @@ func TestResponseHeadersMigrationAndRollback(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer database.Close()
-					var empty int
-					if err := raw.QueryRow("SELECT count(*) FROM request_events WHERE response_headers_json='{}'").Scan(&empty); err != nil || empty != 3 {
-						t.Fatal("historical headers must remain unreported", empty, err)
+					var reports int
+					if err := raw.QueryRow("SELECT count(*) FROM quota_reports").Scan(&reports); err != nil || reports != 0 {
+						t.Fatal("historical quota must remain unreported", reports, err)
 					}
 					view, err := database.RequestEvents(billing.RequestEventQuery{}, time.Time{})
 					if err != nil || view.Total != 3 || view.Statuses.Failed != 1 {
 						t.Fatalf("migrated view = %+v, err = %v", view, err)
 					}
+					for _, entry := range view.Entries {
+						if entry.RequestOrigin != (billing.RequestOrigin{}) || entry.Stream != nil {
+							t.Fatalf("historical request metadata was invented: %+v", entry)
+						}
+					}
+					if plan, _ := mustLoad(t, database).State.FindPlan("stored"); version >= 13 &&
+						(plan.Currency != billing.USD || len(plan.Windows) != 1 || plan.Windows[0].Amount != 2.5) {
+						t.Fatalf("stored plan = %+v", plan)
+					}
 				}
+				if version >= 14 {
+					var provider, preview string
+					var disabled bool
+					if err := raw.QueryRow("SELECT provider,key_preview,disabled FROM config_credentials WHERE ref='saved'").Scan(&provider, &preview, &disabled); err != nil || provider != "codex" || preview != "sk-dum…1234" || !disabled {
+						t.Fatal("credential snapshot lost", err)
+					}
+					if !conflict {
+						var balance string
+						if err := raw.QueryRow("SELECT balance_json FROM config_credentials WHERE ref='saved'").Scan(&balance); err != nil || balance != "null" {
+							t.Fatal("migration invented a balance", balance, err)
+						}
+					}
+				}
+
 				var gotVersion, events, failures int
 				var cost float64
 				wantVersion := schemaVersion
@@ -598,7 +638,11 @@ func TestResponseHeadersMigrationAndRollback(t *testing.T) {
 				if err := raw.QueryRow("PRAGMA user_version").Scan(&gotVersion); err != nil || gotVersion != wantVersion {
 					t.Fatal("incorrect schema version", gotVersion, err)
 				}
-				if err := raw.QueryRow("SELECT count(*),sum(failed),sum(total_usd) FROM request_events").Scan(&events, &failures, &cost); err != nil || events != 3 || failures != 1 || cost != 2.5 {
+				costColumn := "total_cost"
+				if conflict {
+					costColumn = "total_usd"
+				}
+				if err := raw.QueryRow("SELECT count(*),sum(failed),sum("+costColumn+") FROM request_events").Scan(&events, &failures, &cost); err != nil || events != 3 || failures != 1 || cost != 2.5 {
 					t.Fatal("history changed", events, failures, cost, err)
 				}
 				var body string
@@ -650,7 +694,7 @@ func TestUpstreamResponseReportsMigration(t *testing.T) {
 			if _, err := raw.Exec(legacy); err != nil {
 				t.Fatal(err)
 			}
-			database, err := Open(path)
+			database, err := Open(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -660,7 +704,7 @@ func TestUpstreamResponseReportsMigration(t *testing.T) {
 				t.Fatalf("migrated view = %+v, err = %v", view, err)
 			}
 			if entry := view.Entries[1]; entry.ServiceTier != "priority" || entry.ResponseServiceTier != "" ||
-				entry.UpstreamModel != "gpt-5.5" || entry.ResponseModel != "" || entry.Cost.TotalUSD != 2.5 {
+				entry.UpstreamModel != "gpt-5.5" || entry.ResponseModel != "" || entry.Cost.Total != 2.5 {
 				t.Fatalf("migrated entry = %+v", entry)
 			}
 			if entry := view.Entries[0]; !entry.Failed || entry.ErrorBody != "preserved failure" {
@@ -702,7 +746,7 @@ func TestRequestErrorReasonMigration(t *testing.T) {
 					VALUES(1,502,'upstream_error','HTTP 502','{"error":"preserved"}');`); err != nil {
 				t.Fatal(err)
 			}
-			database, err := Open(path)
+			database, err := Open(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -720,5 +764,80 @@ func TestRequestErrorReasonMigration(t *testing.T) {
 				t.Fatal("failed event details were lost", status, errorType, body, err)
 			}
 		})
+	}
+}
+
+func downgradeToV19(t *testing.T, d *DB) {
+	t.Helper()
+	if _, err := d.db.Exec(`
+		DROP INDEX request_events_auth_usage;
+		DROP INDEX config_credentials_auth_index;
+		ALTER TABLE request_events DROP COLUMN currency;
+		ALTER TABLE request_events RENAME COLUMN total_cost TO total_usd;
+		ALTER TABLE request_events RENAME COLUMN uncached_input_cost TO uncached_input_usd;
+		ALTER TABLE request_events RENAME COLUMN cache_read_cost TO cache_read_usd;
+		ALTER TABLE request_events RENAME COLUMN cache_write_cost TO cache_write_usd;
+		ALTER TABLE request_events RENAME COLUMN output_cost TO output_usd;
+		ALTER TABLE prices DROP COLUMN currency;
+		ALTER TABLE plans DROP COLUMN currency;
+		ALTER TABLE config_credentials DROP COLUMN auth_index;
+		ALTER TABLE config_credentials DROP COLUMN type;
+		ALTER TABLE config_credentials DROP COLUMN name;
+		ALTER TABLE config_credentials DROP COLUMN base_url;
+		ALTER TABLE config_credentials DROP COLUMN priority;
+		ALTER TABLE config_credentials DROP COLUMN weight;
+		ALTER TABLE config_credentials DROP COLUMN balance_json;
+		ALTER TABLE config_credentials DROP COLUMN config_ref;
+		ALTER TABLE config_credentials DROP COLUMN note;
+		DROP TABLE quota_report_windows; DROP TABLE quota_reports;
+		ALTER TABLE request_events DROP COLUMN user_agent;
+		ALTER TABLE request_events DROP COLUMN x_forwarded_for;
+		ALTER TABLE request_events ADD COLUMN response_headers_json TEXT NOT NULL DEFAULT '{}';
+		PRAGMA user_version = 19;`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV18ExecutionMetadataMigrationPreservesAllEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v18.db")
+	database := openDatabase(t, path)
+	normal := requestEvent("scope", eventStart)
+	normal.Execution = &billing.ExecutionMetadata{RequestID: "execution"}
+	zero := billing.RequestEvent{At: eventStart.Add(2 * time.Second), Scope: "scope"}
+	failed := billing.RequestEvent{At: eventStart.Add(time.Second), Scope: "scope", Failed: true}
+	mustSave(t, database, billing.NewState(), billing.Changes{NormalRequestEvents: []billing.RequestEvent{normal, zero}, RequestErrorEvents: []billing.RequestErrorEvent{{Event: failed, Error: billing.RequestError{StatusCode: 502, Body: "preserved failure"}}}})
+	downgradeToV19(t, database)
+	if _, err := database.db.Exec("ALTER TABLE request_events DROP COLUMN execution_json; PRAGMA user_version=18;"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database = openDatabase(t, path)
+	view := mustQueryRequestEvents(t, database, billing.RequestEventQuery{})
+	if len(view.Entries) != 3 || view.Statuses.Failed != 1 || view.Entries[1].ErrorBody != "preserved failure" || view.Entries[2].Cost.Total != normal.Cost.Total || view.Entries[0].Cost.Total != 0 {
+		t.Fatalf("history changed: %+v", view)
+	}
+	for _, entry := range view.Entries {
+		if entry.Execution != nil {
+			t.Fatal("invented historical metadata")
+		}
+	}
+	metadata := &billing.ExecutionMetadata{RequestID: "new-execution", TraceID: "trace", SessionID: "session", IsNativeKey: new(bool)}
+	normal.Execution = metadata
+	mustSave(t, database, billing.NewState(), billing.Changes{NormalRequestEvents: []billing.RequestEvent{normal}})
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database = openDatabase(t, path)
+	view = mustQueryRequestEvents(t, database, billing.RequestEventQuery{})
+	found := false
+	for _, entry := range view.Entries {
+		if entry.Execution != nil && entry.Execution.RequestID == metadata.RequestID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("execution metadata lost after reopening")
 	}
 }

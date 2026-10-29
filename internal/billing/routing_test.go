@@ -288,17 +288,6 @@ func TestRoutingSeparatesConfiguredSuffixedModels(t *testing.T) {
 	}
 }
 
-func TestMissingRouteFailsClosed(t *testing.T) {
-	store := newStore(t)
-	store.ReplaceAll(func(state *State) {
-		state.Keys["scope-a"] = &KeyState{RouteBindings: RouteBindings{RouteIDs: []string{"missing"}}}
-	})
-	decision := store.ResolveRouting("scope-a", "gpt-5.6", "gpt-5.6")
-	if decision.AllowsModel() || decision.ConfigurationError == "" {
-		t.Fatalf("decision=%+v", decision)
-	}
-}
-
 func TestRouteRuleNormalizesSelections(t *testing.T) {
 	ref, deniedRef := CredentialFingerprint("dummy-ref"), CredentialFingerprint("dummy-denied")
 	provider := CredentialProviderSelector{Source: CredentialSourceAuthFiles, Provider: "codex"}

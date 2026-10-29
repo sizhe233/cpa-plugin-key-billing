@@ -1,28 +1,52 @@
 package billing
 
-import (
-	"net/http"
-	"time"
-)
+import "time"
+
+// ExecutionMetadata contains host-reported execution identity. CredentialRef is
+// a plugin fingerprint, and BaseURL omits user info, query strings and fragments.
+type ExecutionMetadata struct {
+	RequestID       string `json:"request_id,omitempty"`
+	TraceID         string `json:"trace_id,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	ParentSessionID string `json:"parent_session_id,omitempty"`
+	CredentialRef   string `json:"credential_ref,omitempty"`
+	BaseURL         string `json:"base_url,omitempty"`
+	AccessProvider  string `json:"access_provider,omitempty"`
+	IsNativeKey     *bool  `json:"is_native_key,omitempty"`
+}
+
+// RequestOrigin describes the inbound client request as admission saw it.
+// Endpoint is the route path only; UserAgent and XForwardedFor are the
+// client-reported headers, which the host does not verify.
+type RequestOrigin struct {
+	Endpoint      string `json:"endpoint,omitempty"`
+	Transport     string `json:"transport,omitempty"`
+	UserAgent     string `json:"user_agent,omitempty"`
+	XForwardedFor string `json:"x_forwarded_for,omitempty"`
+}
 
 // RequestEvent is one persisted request record and never stores a plaintext API key.
-// Account contains only an OAuth identity or masked API key.
+// Account names the upstream credential by an OAuth identity, a masked API key
+// or an auth file title.
 type RequestEvent struct {
-	At                  time.Time `json:"at"`
-	Scope               string    `json:"scope"`
-	AuthIndex           string    `json:"auth_index,omitempty"`
-	Provider            string    `json:"provider,omitempty"`
-	Account             string    `json:"account,omitempty"`
-	ExecutorType        string    `json:"executor_type,omitempty"`
-	ReasoningEffort     string    `json:"reasoning_effort,omitempty"`
-	ServiceTier         string    `json:"service_tier,omitempty"`
-	ResponseServiceTier string    `json:"response_service_tier,omitempty"`
-	UpstreamModel       string    `json:"upstream_model,omitempty"`
-	ResponseModel       string    `json:"response_model,omitempty"`
-	BillingModel        string    `json:"billing_model,omitempty"`
-	Failed              bool      `json:"failed"`
-	LatencyMS           int64     `json:"latency_ms,omitempty"`
-	TTFTMS              int64     `json:"ttft_ms,omitempty"`
+	RequestOrigin
+	Execution           *ExecutionMetadata `json:"execution,omitempty"`
+	Stream              *bool              `json:"stream,omitempty"`
+	At                  time.Time          `json:"at"`
+	Scope               string             `json:"scope"`
+	AuthIndex           string             `json:"auth_index,omitempty"`
+	Provider            string             `json:"provider,omitempty"`
+	Account             string             `json:"account,omitempty"`
+	ExecutorType        string             `json:"executor_type,omitempty"`
+	ReasoningEffort     string             `json:"reasoning_effort,omitempty"`
+	ServiceTier         string             `json:"service_tier,omitempty"`
+	ResponseServiceTier string             `json:"response_service_tier,omitempty"`
+	UpstreamModel       string             `json:"upstream_model,omitempty"`
+	ResponseModel       string             `json:"response_model,omitempty"`
+	BillingModel        string             `json:"billing_model,omitempty"`
+	Failed              bool               `json:"failed"`
+	LatencyMS           int64              `json:"latency_ms,omitempty"`
+	TTFTMS              int64              `json:"ttft_ms,omitempty"`
 	// AccountingQuality is empty when the host reported no token detail.
 	AccountingQuality TokenAccountingQuality `json:"accounting_quality,omitempty"`
 	// PriceSource says where the numbers came from. "none" means no rule
@@ -30,11 +54,27 @@ type RequestEvent struct {
 	PriceSource PriceSource `json:"price_source,omitempty"`
 	Cost        Cost        `json:"cost"`
 	// ReasoningTokens is already included in Cost.BilledOutputTokens.
-	ReasoningTokens int64       `json:"reasoning_tokens,omitempty"`
-	QuotaHeaders    http.Header `json:"-"`
+	ReasoningTokens int64        `json:"reasoning_tokens,omitempty"`
+	Quota           *QuotaReport `json:"-"`
 }
 
 const RequestEventRetention = 365 * 24 * time.Hour
+
+func usageTimeRange(from, to, now time.Time) (time.Time, time.Time, error) {
+	if to.IsZero() || to.After(now) {
+		to = now
+	}
+	if from.IsZero() {
+		from = to.Add(-30 * 24 * time.Hour)
+	}
+	if cutoff := now.Add(-RequestEventRetention); from.Before(cutoff) {
+		from = cutoff
+	}
+	if !from.Before(to) {
+		return time.Time{}, time.Time{}, invalidf("The time range is outside the retained request history")
+	}
+	return from, to, nil
+}
 
 // Source uses the event's account snapshot; key labels use their current values.
 type RequestEventRow struct {

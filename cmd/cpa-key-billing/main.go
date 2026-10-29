@@ -95,16 +95,9 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	cMethod := C.CString(method)
 	defer C.free(unsafe.Pointer(cMethod))
 	var response C.cliproxy_buffer
-	var requestPtr *C.uint8_t
-	if len(rawPayload) > 0 {
-		request := C.CBytes(rawPayload)
-		if request == nil {
-			return nil, fmt.Errorf("Allocate host call %s request memory", method)
-		}
-		defer C.free(request)
-		requestPtr = (*C.uint8_t)(request)
-	}
-	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
+	request := C.CBytes(rawPayload)
+	defer C.free(request)
+	callCode := C.call_host_api(cMethod, (*C.uint8_t)(request), C.size_t(len(rawPayload)), &response)
 	if response.ptr != nil {
 		defer C.free_host_buffer(response.ptr, response.len)
 	}
@@ -183,13 +176,6 @@ func cliproxyPluginShutdown() {
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
-	if response == nil || len(raw) == 0 {
-		return
-	}
-	ptr := C.CBytes(raw)
-	if ptr == nil {
-		return
-	}
-	response.ptr = ptr
+	response.ptr = C.CBytes(raw)
 	response.len = C.size_t(len(raw))
 }

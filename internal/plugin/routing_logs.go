@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 
 	"cpa-key-billing/internal/billing"
@@ -16,8 +17,9 @@ type pendingRouteLog struct {
 	ModelRestricted      bool
 	ModelDenied          bool
 	CredentialRestricted bool
-	ConfigurationError   bool
 	SelectedCredentialID string
+	CredentialResult     string
+	CredentialError      string
 }
 
 func boundedLogValue(value string, limit int) string {
@@ -36,21 +38,23 @@ func credentialLogName(credential credentialView) string {
 		if len([]byte(value)) > 512 {
 			return string([]byte(value)[:512])
 		}
-		return credential.Provider + " · " + value
+		return credential.ProviderName + " · " + value
 	}
-	return boundedLogValue(credential.Provider+" · "+credential.DisplayName, 512)
+	return boundedLogValue(credential.ProviderName+" · "+credential.DisplayName, 512)
 }
 
 func (a *App) beginRouteLog(requestID, scope string, decision billing.RoutingDecision) {
-	requestID = strings.TrimSpace(requestID)
 	modelRestricted := decision.RestrictsModels()
 	credentialRestricted := decision.RestrictsCredentials()
-	if requestID == "" || (!modelRestricted && !credentialRestricted && decision.ConfigurationError == "") {
+	if !modelRestricted && !credentialRestricted {
 		return
 	}
 	keyDescription := boundedLogValue(a.store.KeyDescription(scope), 256)
 	a.routingMu.Lock()
 	defer a.routingMu.Unlock()
+	if _, exists := a.pending[requestID]; exists {
+		return
+	}
 	if len(a.pending) >= maxPendingRouteLogs {
 		var oldestID string
 		var oldest uint64
@@ -68,39 +72,35 @@ func (a *App) beginRouteLog(requestID, scope string, decision billing.RoutingDec
 		Model: boundedLogValue(decision.Model, 512), ModelRestricted: modelRestricted,
 		ModelDenied:          modelRestricted && !decision.AllowsModel(),
 		CredentialRestricted: credentialRestricted,
-		ConfigurationError:   decision.ConfigurationError != "",
 	}
 }
 
-func (a *App) observeRouteCredential(requestID, credentialID, credentialIndex string) {
-	requestID = strings.TrimSpace(requestID)
-	credentialID = strings.TrimSpace(credentialID)
-	credentialIndex = strings.TrimSpace(credentialIndex)
-	if credentialID == "" {
-		return
-	}
+func (a *App) observeRouteCredential(req RequestInterceptRequest, result, detail string) {
+	credentialID := metadataString(req.Metadata, MetadataSelectedAuth)
+	credentialIndex := metadataString(req.Metadata, MetadataSelectedIndex)
 	a.routingMu.Lock()
 	defer a.routingMu.Unlock()
-	if ref := a.credentialsByRawID[credentialID]; ref != "" && credentialIndex != "" {
-		a.credentialRefsByIndex[credentialIndex] = ref
+	if credentialID != "" && credentialIndex != "" {
+		ref := billing.CredentialFingerprint(credentialID)
+		if _, known := a.credentials[ref]; known {
+			a.credentialRefsByIndex[credentialIndex] = ref
+		}
 	}
-	if requestID == "" {
-		return
-	}
-	pending, ok := a.pending[requestID]
+	pending, ok := a.pending[req.RequestID]
 	if !ok {
 		return
 	}
 	pending.SelectedCredentialID = credentialID
-	a.pending[requestID] = pending
+	pending.CredentialResult = result
+	pending.CredentialError = boundedLogValue(detail, 512)
+	pending.CredentialRestricted = result != "unrestricted"
+	a.pending[req.RequestID] = pending
 }
 
 func (a *App) finishRouteLog(completion RequestCompletion) {
 	a.routingMu.Lock()
-	pending, ok := a.pending[strings.TrimSpace(completion.RequestID)]
-	if ok {
-		delete(a.pending, strings.TrimSpace(completion.RequestID))
-	}
+	pending, ok := a.pending[completion.RequestID]
+	delete(a.pending, completion.RequestID)
 	a.routingMu.Unlock()
 	if !ok {
 		return
@@ -109,40 +109,48 @@ func (a *App) finishRouteLog(completion RequestCompletion) {
 	if pending.ModelRestricted {
 		row["model_policy"] = "restricted"
 	}
-	if pending.ConfigurationError {
-		row["model_result"] = "configuration_error"
-	} else if pending.ModelDenied {
+	if pending.ModelDenied {
 		row["model_result"] = "deny"
 	}
 	if pending.CredentialRestricted {
 		row["credential_policy"] = "restricted"
 		row["credential_result"] = "not_observed"
 	}
-	if pending.ConfigurationError {
-		row["credential_result"] = "configuration_error"
-	} else if pending.ModelDenied {
+	if pending.ModelDenied {
 		row["credential_result"] = "not_reached"
 	} else if pending.CredentialRestricted {
-		id := pending.SelectedCredentialID
-		if id != "" {
-			if credential, found := a.credentialByRawID(id); found {
-				row["credential_result"] = "selected"
-				row["selected_credential"] = credentialLogName(credential)
-			} else {
-				ref := billing.CredentialFingerprint(id)
-				row["credential_result"] = "selected"
-				row["selected_credential"] = "Unknown upstream credential · " + shortCredentialRef(ref)
+		if pending.CredentialResult != "" {
+			row["credential_result"] = pending.CredentialResult
+		} else if completion.StatusCode == http.StatusServiceUnavailable {
+			for _, shortfall := range routingShortfalls {
+				if strings.Contains(completion.Error, shortfall.message) {
+					row["credential_result"] = shortfall.result
+					break
+				}
 			}
-		} else if completion.StatusCode == 503 && strings.Contains(completion.Error, noRoutedCredentialMessage) {
-			row["credential_result"] = "no_match"
 		}
+	}
+	if pending.CredentialRestricted && pending.SelectedCredentialID != "" {
+		if credential, found := a.credentialByRawID(pending.SelectedCredentialID); found {
+			row["selected_credential"] = credentialLogName(credential)
+		} else {
+			ref := billing.CredentialFingerprint(pending.SelectedCredentialID)
+			row["selected_credential"] = "Unknown upstream credential · " + shortCredentialRef(ref)
+		}
+	}
+	if pending.CredentialError != "" {
+		row["credential_error"] = pending.CredentialError
 	}
 	if completion.StatusCode > 0 {
 		row["status"] = completion.StatusCode
 	}
-	raw, err := json.Marshal(row)
-	if err != nil {
-		return
+	raw, _ := json.Marshal(row)
+	level := billing.PluginLogDebug
+	switch row["credential_result"] {
+	case "deny", "unverified", routeNoCredential.result:
+		level = billing.PluginLogError
+	case routeUnavailable.result, routeNoMatch.result:
+		level = billing.PluginLogInfo
 	}
-	a.store.AddPluginLog(billing.PluginLogDebug, "route %s", raw)
+	a.store.AddPluginLog(level, "route %s", raw)
 }

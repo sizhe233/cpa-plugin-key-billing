@@ -13,37 +13,10 @@ import (
 	"cpa-key-billing/internal/messages"
 )
 
-const hostHTTPDo = "host.http.do"
-
-type hostAuthGetResponse struct {
-	JSON json.RawMessage `json:"json"`
-}
-
-type hostHTTPRequest struct {
-	HostCallbackID string      `json:"host_callback_id,omitempty"`
-	Method         string      `json:"method"`
-	URL            string      `json:"url"`
-	Headers        http.Header `json:"headers,omitempty"`
-	Body           []byte      `json:"body,omitempty"`
-}
-
-type hostHTTPResponse struct {
-	StatusCode int    `json:"StatusCode"`
-	Body       []byte `json:"Body"`
-}
-
 func (a *App) openAuthQuotaClient(callbackID string, file hostAuthFile) (*authQuotaClient, error) {
-	raw, errGet := a.hostCaller(hostAuthGet, map[string]string{"auth_index": file.AuthIndex})
-	if errGet != nil {
-		return nil, messages.Errorf("Read auth file: %w", errGet)
-	}
-	var auth hostAuthGetResponse
-	if errDecode := json.Unmarshal(raw, &auth); errDecode != nil {
-		return nil, messages.Errorf("Parse auth file: %w", errDecode)
-	}
-	var credential map[string]any
-	if errDecode := json.Unmarshal(auth.JSON, &credential); errDecode != nil {
-		return nil, messages.Errorf("Invalid auth file contents")
+	credential, err := a.readHostAuthFile(file.AuthIndex)
+	if err != nil {
+		return nil, err
 	}
 	return newAuthQuotaClient(a.hostCaller, callbackID, credential)
 }
@@ -105,13 +78,9 @@ func (c *authQuotaClient) close() {
 
 func (c *authQuotaClient) do(request hostHTTPRequest) (hostHTTPResponse, error) {
 	if c.client == nil {
-		raw, errCall := c.hostCaller(hostHTTPDo, request)
+		response, errCall := callHostHTTP(c.hostCaller, request)
 		if errCall != nil {
 			return hostHTTPResponse{}, messages.Errorf("Quota request failed: %s", c.redact(errCall.Error()))
-		}
-		var response hostHTTPResponse
-		if errDecode := json.Unmarshal(raw, &response); errDecode != nil {
-			return hostHTTPResponse{}, messages.Errorf("Parse quota response: %w", errDecode)
 		}
 		return response, nil
 	}
@@ -207,4 +176,54 @@ func upstreamErrorMessage(object map[string]any) string {
 		message = message[:500] + "…"
 	}
 	return message
+}
+
+func credentialRecords(credential map[string]any) []map[string]any {
+	var records []map[string]any
+	var visit func(map[string]any, int)
+	visit = func(record map[string]any, depth int) {
+		if record == nil || depth > 2 {
+			return
+		}
+		records = append(records, record)
+		for _, key := range []string{"metadata", "attributes", "oauth", "raw", "credential", "auth", "token", "installed", "web", "user"} {
+			if nested, ok := record[key].(map[string]any); ok {
+				visit(nested, depth+1)
+			}
+		}
+	}
+	visit(credential, 0)
+	return records
+}
+
+func credentialString(credential map[string]any, keys ...string) string {
+	for _, record := range credentialRecords(credential) {
+		if value := firstString(record, keys...); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func credentialToken(credential map[string]any) string {
+	return credentialString(credential, "access_token", "accessToken", "token", "id_token", "idToken", "cookie")
+}
+
+func credentialUsesAPIKey(credential map[string]any) bool {
+	if credentialString(credential, "api_key", "apiKey") != "" {
+		return true
+	}
+	for _, record := range credentialRecords(credential) {
+		if usingAPI, ok := boolValue(record, "using_api", "usingApi"); ok && usingAPI {
+			return true
+		}
+	}
+	return false
+}
+
+func redactSecret(value, secret string) string {
+	if secret == "" {
+		return value
+	}
+	return strings.ReplaceAll(value, secret, "[REDACTED]")
 }

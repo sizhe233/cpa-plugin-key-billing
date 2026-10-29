@@ -19,7 +19,7 @@ func requestEvent(scope string, at time.Time) billing.RequestEvent {
 		LatencyMS: 1500, TTFTMS: 250,
 		AccountingQuality: billing.TokenAccountingComplete, PriceSource: billing.PriceSourceCustom,
 		Cost: billing.Cost{
-			TotalUSD: 0.5, UncachedInputUSD: 0.2, OutputUSD: 0.3,
+			Total: 0.5, UncachedInput: 0.2, Output: 0.3,
 			UncachedInputTokens: 500, BilledOutputTokens: 500,
 		},
 	}
@@ -103,16 +103,22 @@ func TestRequestEventFailedFilterKeepsOverallCounts(t *testing.T) {
 
 func TestRequestEventFieldAndTimeFilters(t *testing.T) {
 	database, state := requestEventDatabase(t)
+	// A credential that is not loaded has no auth index, so it names no event.
+	for id, credential := range map[string]billing.ConfigCredentialDetails{
+		"dummy-xai": {Provider: "xai", AuthIndex: "auth-xai", Name: "xAI Team"}, "dummy-disabled": {Name: "Legacy", Disabled: true},
+	} {
+		state.ConfigCredentials[billing.CredentialFingerprint(id)] = billing.ConfigCredential{ConfigCredentialDetails: credential}
+	}
 	entry := requestEvent("scope-b", eventStart.Add(6*time.Minute))
 	entry.AuthIndex = "auth-xai"
 	entry.Provider = "xai"
-	entry.Account = "ops-xai@example.com"
+	entry.Account = "xai-du…0001"
 	entry.UpstreamModel = "gpt-5.6-sol"
 	entry.BillingModel = "team/gpt-5.6-sol"
-	mustSave(t, database, state, billing.Changes{NormalRequestEvents: []billing.RequestEvent{entry}})
+	mustSave(t, database, state, billing.Changes{ConfigCredentials: true, NormalRequestEvents: []billing.RequestEvent{entry}})
 
 	query := billing.RequestEventQuery{
-		KeyScope: "scope-b", Model: "team/gpt-5.6-sol", Source: "xai · ops-xai@example.com",
+		KeyScope: "scope-b", Model: "team/gpt-5.6-sol", Source: "xAI Team · xai-du…0001",
 		From: eventStart.Add(6 * time.Minute), To: eventStart.Add(7 * time.Minute), IncludeFilters: true,
 	}
 	view := mustQueryRequestEvents(t, database, query)
@@ -122,7 +128,7 @@ func TestRequestEventFieldAndTimeFilters(t *testing.T) {
 	if view.Filters == nil || len(view.Filters.Models) != 1 || len(view.Filters.Sources) != 1 {
 		t.Fatalf("filter options = %+v", view.Filters)
 	}
-	query.Source = "XAI · ops-xai@example.com"
+	query.Source = "XAI TEAM · xai-du…0001"
 	if view := mustQueryRequestEvents(t, database, query); view.Total != 0 {
 		t.Fatal("source filter no longer uses exact matching")
 	}
@@ -134,12 +140,13 @@ func TestRequestEventFieldAndTimeFilters(t *testing.T) {
 	}
 
 	entry.At = entry.At.Add(time.Minute)
-	entry.BillingModel = ""
+	entry.AuthIndex, entry.BillingModel = "", ""
 	mustSave(t, database, state, billing.Changes{NormalRequestEvents: []billing.RequestEvent{entry}})
 	view = mustQueryRequestEvents(t, database, billing.RequestEventQuery{
 		Model: entry.UpstreamModel, From: entry.At, To: entry.At.Add(time.Minute), IncludeFilters: true,
 	})
-	if view.Total != 1 || len(view.Entries) != 1 || len(view.Filters.Models) != 1 || view.Filters.Models[0] != entry.UpstreamModel {
+	if view.Total != 1 || len(view.Entries) != 1 || len(view.Filters.Models) != 1 || view.Filters.Models[0] != entry.UpstreamModel ||
+		view.Entries[0].Source != "xai · xai-du…0001" {
 		t.Fatalf("upstream model filter = %+v", view)
 	}
 }
@@ -148,9 +155,12 @@ func TestRequestEventAccountChangesPreserveHistory(t *testing.T) {
 	database, state := requestEventDatabase(t)
 	original := mustQueryRequestEvents(t, database, billing.RequestEventQuery{})
 	entry := requestEvent("scope-a", eventStart.Add(10*time.Minute))
+	streaming, nonStreaming := true, false
 	entry.Account = "new@example.com"
+	entry.Endpoint, entry.Transport, entry.Stream = "/v1/messages", "http", &nonStreaming
 	mustSave(t, database, state, billing.Changes{RequestErrorEvents: []billing.RequestErrorEvent{{Event: entry}}})
 	entry.Provider = "openai-compatible-dummy"
+	entry.Endpoint, entry.Transport, entry.Stream = "/v1/responses", "websocket", &streaming
 	mustSave(t, database, state, billing.Changes{RequestErrorEvents: []billing.RequestErrorEvent{{Event: entry}}})
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
@@ -161,12 +171,14 @@ func TestRequestEventAccountChangesPreserveHistory(t *testing.T) {
 	}
 	wantSources := make(map[string]int64)
 	for _, test := range []struct {
-		source           string
-		requests, failed int
+		source              string
+		requests, failed    int
+		endpoint, transport string
+		stream              *bool
 	}{
-		{"codex · ops@example.com", 6, 2},
-		{"codex · new@example.com", 1, 1},
-		{"dummy · new@example.com", 1, 1},
+		{"codex · ops@example.com", 6, 2, "", "", nil},
+		{"codex · new@example.com", 1, 1, "/v1/messages", "http", &nonStreaming},
+		{"dummy · new@example.com", 1, 1, "/v1/responses", "websocket", &streaming},
 	} {
 		wantSources[test.source] = int64(test.requests)
 		query := billing.RequestEventQuery{Source: test.source,
@@ -175,17 +187,22 @@ func TestRequestEventAccountChangesPreserveHistory(t *testing.T) {
 		if view.Total != test.requests || view.Statuses.Failed != test.failed || len(view.Filters.Sources) != 3 {
 			t.Fatalf("filtered events = %+v", view)
 		}
+		for _, row := range view.Entries {
+			if row.Endpoint != test.endpoint || row.Transport != test.transport || !reflect.DeepEqual(row.Stream, test.stream) {
+				t.Fatalf("request metadata changed after reopen: %+v", row)
+			}
+		}
 		errors, err := database.RequestErrors(billing.RequestErrorQuery{Source: test.source}, eventStart)
 		if err != nil || errors.Total != test.failed || errors.Entries[0].Source != test.source {
 			t.Fatalf("filtered errors = %+v, err = %v", errors, err)
 		}
-		analysis, err := database.Analysis(query, eventStart)
+		analysis, err := database.Analysis(query, 7, eventStart)
 		if err != nil || analysis.Summary.Requests != int64(test.requests) ||
 			len(analysis.UsageDistribution.Sources) != 1 || analysis.UsageDistribution.Sources[0].Label != test.source {
 			t.Fatalf("filtered analysis = %+v, err = %v", analysis, err)
 		}
 	}
-	analysis, err := database.Analysis(billing.RequestEventQuery{From: eventStart, To: eventStart.Add(time.Hour)}, eventStart)
+	analysis, err := database.Analysis(billing.RequestEventQuery{From: eventStart, To: eventStart.Add(time.Hour)}, 7, eventStart)
 	if err != nil {
 		t.Fatal(err)
 	}

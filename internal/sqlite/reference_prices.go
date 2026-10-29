@@ -13,7 +13,7 @@ import (
 // Reference prices use a separate connection so queries do not take the billing
 // Store lock. Downloads and parsing finish before the write transaction starts.
 func (d *DB) OpenReferencePrices() (billing.ReferencePriceRepository, error) {
-	return Open(d.path)
+	return connect(d.path)
 }
 
 func (d *DB) LoadReferencePriceMetadata(ctx context.Context) (billing.ReferencePriceMetadata, error) {

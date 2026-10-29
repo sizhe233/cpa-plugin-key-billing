@@ -13,7 +13,7 @@ const resources = {
     models: m("ui.model_catalog"),
     catalog: m("ui.model_prices"),
     priceStatus: m("ui.reference_price_status"),
-    authFiles: m("ui.auth_files")
+    currency: m("ui.exchange_rate")
   }),
   account: dataEntries({
     profile: m("ui.account_profile"),
@@ -21,7 +21,7 @@ const resources = {
     routing: m("ui.access_permissions"),
     models: m("ui.model_catalog"),
     catalog: m("ui.model_prices"),
-    authFiles: m("ui.auth_files")
+    currency: m("ui.exchange_rate")
   })
 };
 // Key metadata is shared by configuration, event queries, and analysis.
@@ -65,7 +65,7 @@ const resourceGroups = {
   admin: {
     configuration: { names: ["keys", "plans", "routes", "credentials", "models"], syncErrors: [] },
     pricing: { names: ["catalog", "priceStatus"], after: "configuration" },
-    authFiles: { names: ["authFiles"] }
+    currency: { names: ["currency"] }
   },
   account: {
     ...Object.fromEntries(Object.keys(resources.account).map((name) => [name, { names: [name] }])),
@@ -119,6 +119,7 @@ function createQuery(label, receive = (value) => value) {
           }
         });
       query.task = task;
+      updateRefreshControls();
       return task;
     }
   };
@@ -126,6 +127,17 @@ function createQuery(label, receive = (value) => value) {
 }
 
 const analysisQueries = Object.fromEntries(["admin", "account"].map((role) => [role, createQuery(m("ui.analysis"))]));
+const speedQueries = Object.fromEntries(["admin", "account"].map((role) => [role, createQuery(m("ui.speed_trend"))]));
+const authFilesQueries = Object.fromEntries(
+  ["admin", "account"].map((role) => [
+    role,
+    createQuery(m("ui.auth_files"), (files) => {
+      updateAuthFiles(role === "account", files);
+      return files;
+    })
+  ])
+);
+const aiProvidersQueries = Object.fromEntries(["admin", "account"].map((role) => [role, createQuery(m("ui.ai_providers"))]));
 const eventKeysQuery = createQuery(m("ui.event_api_key_filter"));
 const UNASSIGNED_KEY = "__unassigned__";
 
@@ -182,43 +194,21 @@ async function fetchListPage(kind, account, params, previous = null) {
   const query = new URLSearchParams({ ...params, ...previous?.cursor });
   const path = view.endpoint + "?" + query;
   const revision = keyDirectory.beginRead();
-  const page = requireObject(await (account ? accountAPI(path) : plugin("GET", path)), view.label);
-  const entries = requireArray(page.entries, view.label);
-  const integer = (value) => Number.isSafeInteger(value) && value >= 0;
-  const id = (value) => (typeof value === "string" && /^-?\d+$/.test(value)) || Number.isSafeInteger(value);
-  const invalid = () => { throw new UIError(m("ui.invalid_pagination_response_for_value", { v0: view.label })); };
-  if (entries.length > Number(params.limit) || entries.some((entry) => !entry || !id(entry.id))) invalid();
+  const page = await (account ? accountAPI(path) : plugin("GET", path));
+  const entries = page.entries;
   let cursor = null;
   if (view.timed) {
-    if (!integer(page.total) || !id(page.snapshot_id) || Number(page.snapshot_id) < 0) invalid();
-    if (previous?.cursor && String(page.snapshot_id) !== previous.cursor.snapshot_id) invalid();
-    // Retention may change totals or leave short/empty pages. Offset uses
-    // the actual response length, independently of display deduplication.
+    // Retention may change totals or leave short/empty pages.
     const offset = (previous?.cursor?.offset || 0) + entries.length;
     if (entries.length && offset < page.total) cursor = { offset, snapshot_id: String(page.snapshot_id) };
-  } else {
-    if (!Object.values(requireObject(page.level_counts, m("ui.log_level_counts"))).every(integer)) invalid();
-    const next = page.next_before_id ?? 0;
-    if (!id(next) || Number(next) < 0) invalid();
-    if (BigInt(next)) {
-      if (!entries.length || (previous?.cursor && BigInt(next) >= BigInt(previous.cursor.before_id))) invalid();
-      cursor = { before_id: String(next) };
-    }
-  }
+  } else if (page.next_before_id) { cursor = { before_id: String(page.next_before_id) }; }
   return { page, params, cursor, previous, revision };
 }
 
 // createQuery calls this only after accepting the response. Stale reads
 // cannot publish Key metadata or append rows to a newer selection.
 function mergeListPage(kind, account, { page, params, cursor, previous, revision }) {
-  const seen = new Set((previous?.page.entries || []).map((entry) => String(entry.id)));
-  const incoming = page.entries.filter((entry) => {
-    const id = String(entry.id);
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
-  const rows = PAGED_LIST_VIEWS[kind].keyed && !account ? keyDirectory.receive(incoming, revision) : incoming;
+  const rows = PAGED_LIST_VIEWS[kind].keyed && !account ? keyDirectory.receive(page.entries, revision) : page.entries;
   return {
     page: {
       ...page,
@@ -256,16 +246,16 @@ function createPagedList(kind, account) {
     renderItems(items, options) {
       const previous = list.rendered;
       const identities = view.keyed && !account ? keyDirectory.value : null;
-      const columns = JSON.stringify(options.headers || null);
-      // Appended pages retain the same entry objects. Rebuild when the
-      // identity metadata or table shape changes, or rows are no longer a prefix.
+      const shape = JSON.stringify([options.headers || null, moneyDisplayKey()]);
+      // Appended pages retain the same entry objects. Rebuild when the identity
+      // metadata, table shape or displayed currency changes, or rows are no longer a prefix.
       const append =
-        previous?.rows?.isConnected && previous.columns === columns && previous.identities === identities &&
+        previous?.rows?.isConnected && previous.shape === shape && previous.identities === identities &&
         previous.items.length <= items.length &&
         previous.items.every((item, index) => item === items[index]);
       const rows = append ? previous.rows : renderCollection(list.scroller, items, options);
       if (append) rows.append(...items.slice(previous.items.length).map(options.render));
-      list.rendered = { items, columns, rows, identities };
+      list.rendered = { items, shape, rows, identities };
     },
     load(reload = false) {
       const selection = pagedListSelection(kind, account);
@@ -396,7 +386,7 @@ function saveChoice(role, id) {
 
 async function fetchAdminCollection(name) {
   const result = await plugin("GET", "/" + name);
-  return requireArray(result?.[name], resources.admin[name].label);
+  return result[name];
 }
 
 function editorData(kind) {
@@ -425,9 +415,7 @@ function queueAdminData(group, operation) {
 }
 
 async function readAdminConfiguration(read) {
-  // Keep plaintext configuration out of the resource cache.
-  const config = api("GET", "/v0/management/config", null, { raw: true }).then((value) => requireObject(value, m("ui.cpa_configuration")));
-  const configuredKeys = config.then(parseConfiguredAPIKeys);
+  const configuredKeys = fetchConfiguredAPIKeys();
   const errors = [];
   const sync = async (label, operation) => {
     try { await operation(); } catch (error) {
@@ -437,9 +425,7 @@ async function readAdminConfiguration(read) {
   };
   const synced = settleLoads([
     sync("API Key", async () => plugin("POST", "/keys/sync", { keys: await configuredKeys, allow_empty: true }, { command: true })),
-    sync(m("ui.credentials"), async () =>
-      plugin("POST", "/credentials/sync", { credentials: await parseConfiguredCredentials(await config) }, { command: true })
-    )
+    sync(m("ui.credentials"), syncConfiguredProviders)
   ]);
   await settleLoads([
     read("plans", () => fetchAdminCollection("plans")),
@@ -458,10 +444,7 @@ function writeAdmin(method, path, data = null, options) {
     if (path.startsWith("/prices")) body.models = models || [];
     const result = await plugin(method, path + (path.includes("?") ? "&" : "?") + "view=1", body, { ...options, command: true });
     current();
-    // Display errors must not turn a committed write into a failed save.
-    try { applyAdminView(requireObject(result.view, m("ui.save_result")), models); } catch (error) {
-      notify(m("ui.saved_but_failed_to_update_the_view_value", { v0: error.message }), "err");
-    }
+    applyAdminView(result.view, models);
     return result;
   });
 }
@@ -470,13 +453,13 @@ function applyAdminView(view, models) {
   for (const name of ["keys", "plans", "routes"]) {
     if (!Object.hasOwn(view, name)) continue;
     const resource = resources.admin[name];
-    const rows = requireArray(view[name], resource.label);
+    const rows = view[name];
     // A committed view supersedes metadata from any read already in flight.
     Object.assign(resource, { value: name === "keys" ? keyDirectory.receive(rows) : rows, error: "" });
   }
   const catalog = resources.admin.catalog;
   if (Object.hasOwn(view, "prices")) {
-    const prices = requireArray(view.prices, catalog.label);
+    const prices = view.prices;
     catalog.value = { models, prices: prices.map((price) => ({ ...price, in_models: models === null ? undefined : price.in_models })) };
     catalog.error = "";
   }
@@ -494,26 +477,34 @@ async function mutateAdmin(method, path, data = null, options) {
   return result;
 }
 
-async function fetchModelPrices(models, account) {
+// Long selections split across requests, so that each URL stays within common proxy limits.
+const QUERY_BATCH_LENGTH = 3300;
+
+function batchedSearchParams(name, values) {
   const batches = [];
   let query = new URLSearchParams();
-  for (const model of models) {
-    const parameter = new URLSearchParams({ model }).toString();
-    if (parameter.length > 3300) throw new UIError(m("ui.model_id_is_too_long"));
-    if (query.size && query.toString().length + parameter.length + 1 > 3300) {
+  for (const value of values) {
+    const parameter = new URLSearchParams({ [name]: value }).toString();
+    if (query.size && query.toString().length + parameter.length + 1 > QUERY_BATCH_LENGTH) {
       batches.push(query);
       query = new URLSearchParams();
     }
-    query.append("model", model);
+    query.append(name, value);
   }
   if (query.size || !batches.length) batches.push(query);
+  return batches;
+}
+
+async function fetchModelPrices(models, account) {
+  if (models.some((model) => new URLSearchParams({ model }).toString().length > QUERY_BATCH_LENGTH))
+    throw new UIError(m("ui.model_id_is_too_long"));
+  const batches = batchedSearchParams("model", models);
   const prices = new Map();
   for (const [index, batch] of batches.entries()) {
     batch.set("include_custom", String(!account && index === 0));
     const path = "/prices?" + batch.toString();
     const rows = await (account ? accountAPI(path) : plugin("GET", path));
-    for (const row of requireArray(rows, m("ui.model_prices"))) {
-      if (!row || typeof row.model_id !== "string") throw new UIError(m("ui.invalid_model_price_response"));
+    for (const row of rows) {
       const key = row.model_id.toLowerCase();
       const previous = prices.get(key);
       prices.set(key, { ...row, in_models: row.in_models || previous?.in_models || false });
@@ -523,14 +514,15 @@ async function fetchModelPrices(models, account) {
 }
 
 async function fetchConfiguredAPIKeys() {
-  const result = await api("GET", "/v0/management/api-keys", null, { raw: true });
-  return parseConfiguredAPIKeys(result);
+  const result = await api("GET", "/v0/management/api-keys", null);
+  return result["api-keys"] || [];
 }
 
+// The plugin filters /v1/models by the key's routing rules; management lists every model.
 async function fetchModels(account, key) {
-  const result = await api("GET", "/v1/models", null, { raw: true, key, auxiliaryCredential: !account });
-  const rows = requireArray(result?.data, m("ui.cpa_model_list"));
-  if (rows.some((row) => !row || typeof row.id !== "string" || !row.id.trim())) throw new UIError(m("ui.invalid_cpa_model_list"));
+  const headers = account ? {} : { "X-CPA-Key-Billing-Models": "all" };
+  const result = await api("GET", "/v1/models", null, { key, headers, auxiliaryCredential: !account });
+  const rows = result.data;
   const models = [...new Set(rows.map((row) => row.id))].sort(compareModelId);
   const previous = resources[account ? "account" : "admin"].models.value;
   // The model list is the catalog's input. Preserve its identity when
@@ -543,20 +535,6 @@ async function fetchCatalog(account) {
   if (account && models === null) throw new UIError(m("ui.model_catalog_is_not_available_yet"));
   const prices = await fetchModelPrices(models || [], account);
   return { models, prices: prices.map((price) => ({ ...price, in_models: models === null ? undefined : price.in_models })) };
-}
-
-async function fetchAccountData(name) {
-  const result = requireObject(await accountAPI("/" + name), name);
-  if (name === "profile" && typeof result.tracked !== "boolean") throw new UIError(m("ui.invalid_account_profile_response"));
-  if (name === "subscription") {
-    requireObject(result.subscription, m("ui.subscription"));
-    requireObject(result.concurrency, m("ui.concurrency_status"));
-  }
-  if (name === "routing") {
-    requireArray(result.models, m("ui.model_permissions"));
-    requireArray(result.credentials, m("ui.credential_permissions"));
-  }
-  return result;
 }
 
 function dataGroupCached(account, group) {
@@ -594,20 +572,14 @@ function loadDataGroup(account, name, reload = false) {
     };
     if (account) {
       await read(name, () =>
-        name === "authFiles"
-          ? fetchAuthFiles(true)
-          : name === "models" ? fetchModels(true, authKey) : name === "catalog" ? fetchCatalog(true) : fetchAccountData(name)
+        name === "models" ? fetchModels(true, authKey) : name === "catalog" ? fetchCatalog(true) : accountAPI("/" + name)
       );
     } else if (name === "configuration") { group.syncErrors = await readAdminConfiguration(read); } else if (name === "pricing") {
-      await settleLoads([
-        read("catalog", () => fetchCatalog(false)),
-        read("priceStatus", async () => requireObject(await plugin("GET", "/prices/reference/status"), m("ui.reference_price_status")))
-      ]);
-    } else { await read("authFiles", () => fetchAuthFiles(false)); }
+      await settleLoads([read("catalog", () => fetchCatalog(false)), read("priceStatus", () => plugin("GET", "/prices/reference/status"))]);
+    } else { await read(name, () => plugin("GET", "/" + name)); }
     if (generation !== sessionGeneration) throw new StaleRequestError();
     if (account && name !== "profile" && !resources.account.profile.value?.tracked) return;
     if (values.keys) values.keys = keyDirectory.receive(values.keys, identityRevision);
-    if (values.authFiles) updateAuthFiles(account, values.authFiles);
     for (const [key, value] of Object.entries(values)) Object.assign(resources[role][key], { value, error: "" });
     for (const { key, error } of failures) resources[role][key].error = error.message || String(error);
     for (const key of group.names) resources[role][key].readAt = Date.now();
@@ -616,6 +588,8 @@ function loadDataGroup(account, name, reload = false) {
         if (key !== "profile") Object.assign(resource, { value: null, error: "", readAt: 0 });
       }
       analysisQueries.account.clear();
+      speedQueries.account.clear();
+      authFilesQueries.account.clear();
       for (const list of Object.values(pagedLists.account)) list.reset();
       resetAuthQuotaMemory(true);
       persistAuthQuotaCache(true);
@@ -638,6 +612,9 @@ function createPages(role) {
   const data = {
     ...resources[role],
     analysis: analysisQueries[role],
+    speed: speedQueries[role],
+    authFiles: authFilesQueries[role],
+    aiProviders: aiProvidersQueries[role],
     eventKeys: eventKeysQuery,
     keyDirectory,
     ...Object.fromEntries(Object.entries(pagedLists[role]).map(([name, list]) => [name, list.query]))
@@ -645,16 +622,53 @@ function createPages(role) {
   const section = (names, render) => ({ sources: names.map((name) => data[name]), render, displayed: null });
   const keyedSection = (names, render) => section(account ? names : [...names, "keyDirectory"], render);
   const result = {
-    analysis: { query: "analysis", sections: [] },
-    "request-events": { query: "events", sections: [keyedSection(["events"], () => renderRequestEvents(account))] },
-    errors: { query: "errors", sections: [keyedSection(["errors"], () => renderErrors(account))] },
-    "auth-files": { sections: [section(["authFiles"], () => renderAuthFiles(account))] }
+    analysis: {
+      timeRange: true,
+      currency: true,
+      autoRefresh: true,
+      queries: [data.analysis, data.speed],
+      load: (reload) => loadAnalysis(account, reload),
+      renderStatus: () => renderAnalysis(account),
+      sections: []
+    },
+    "request-events": {
+      timeRange: true,
+      currency: true,
+      autoRefresh: true,
+      eventColumns: true,
+      exportEvents: true,
+      list: pagedLists[role].events,
+      sections: [keyedSection(["events"], () => renderRequestEvents(account))]
+    },
+    errors: {
+      timeRange: true,
+      autoRefresh: true,
+      exportEvents: true,
+      list: pagedLists[role].errors,
+      sections: [keyedSection(["errors"], () => renderErrors(account))]
+    },
+    "ai-providers": {
+      timeRange: true,
+      currency: true,
+      autoRefresh: true,
+      queries: [data.aiProviders],
+      load: (reload) => readAIProviders(account, reload),
+      sections: [section(["aiProviders"], () => renderAIProviders(account))]
+    },
+    "auth-files": {
+      timeRange: true,
+      currency: true,
+      autoRefresh: true,
+      queries: [data.authFiles],
+      load: (reload) => readAuthFiles(account, reload),
+      sections: [section(["authFiles"], () => renderAuthFiles(account))]
+    }
   };
   if (account) {
     result.subscription = {
       sections: [
         section(["subscription"], renderAccountSubscription),
-        section(["models", "catalog", "routing"], renderAccountModels),
+        section(["models", "catalog", "routing", "profile"], renderAccountModels),
         section(["routing"], renderAccountRouting)
       ]
     };
@@ -664,7 +678,7 @@ function createPages(role) {
     result.keys = { editors: ["route"], sections: [keyedSection(["keys", "plans", "routes", "credentials"], renderKeys)] };
     result.settings = {
       editors: ["plan", "route"],
-      query: "logs",
+      list: pagedLists[role].logs,
       sections: [
         keyedSection(["plans", "keys"], renderPlans),
         keyedSection(["routes", "keys", "credentials"], renderRoutes),
@@ -675,12 +689,18 @@ function createPages(role) {
     };
   }
   for (const page of Object.values(result)) {
-    page.sources = [...new Set(page.sections.flatMap((section) => section.sources))];
+    if (page.list) {
+      page.queries = [page.list.query];
+      page.load = page.list.load;
+      page.renderStatus = () => { if (page.list.data) page.list.renderStatus(); };
+    }
+    // Pages that show amounts load the exchange rate to convert them.
+    const rate = page.currency ? [data.currency] : [];
+    page.sources = [...new Set([...page.sections.flatMap((section) => section.sources), ...(page.queries || []), ...rate])];
     for (const editor of page.editors || []) {
       for (const name of EDITOR_RESOURCES[editor]) if (!page.sources.includes(data[name])) page.sources.push(data[name]);
     }
     if (page.sources.includes(data.catalog) && !page.sources.includes(data.models)) page.sources.push(data.models);
-    if (page.query === "analysis") page.sources.push(data.analysis);
     page.groups = Object.entries(resourceGroups[role]).filter(([, group]) => group.names.some((name) => page.sources.includes(data[name])))
       .map(([name]) => name);
     if (account) page.sources.unshift(data.profile);
@@ -699,21 +719,20 @@ function renderPage() {
   const page = currentPage();
   if (!page) return;
   const account = currentRole === "account";
-  updateRefreshButtons();
+  updateRefreshControls();
+  renderDisplayCurrency();
   renderDataNotice();
   if (account && !renderAccountProfile()) return;
   for (const section of page.sections) {
-    const values = [locale(), ...section.sources.flatMap((source) => [source.value, source.value === null ? source.error : ""])];
+    const values = [
+      locale(),
+      moneyDisplayKey(),
+      ...section.sources.flatMap((source) => [source.value, source.value === null ? source.error : ""])
+    ];
     if (section.displayed?.every((value, index) => value === values[index])) continue;
     if (section.render() !== false) section.displayed = values;
   }
-  // Charts also depend on theme and library availability, and retain
-  // their own canvas/update state across navigation and resizing.
-  if (page.query === "analysis") renderAnalysis(account);
-  else if (page.query) {
-    const list = pagedList(page.query, account);
-    if (list.data) list.renderStatus();
-  }
+  page.renderStatus?.();
 }
 
 function loadPage(account, { reload = false } = {}) {
@@ -727,13 +746,7 @@ function loadPage(account, { reload = false } = {}) {
     if (!account || resources.account.profile.value?.tracked) {
       tasks.push(...page.groups.map((name) => loadDataGroup(account, name, reload)));
       if (page.sources.includes(eventKeysQuery)) tasks.push(readEventKeys(reload));
-      if (page.query === "analysis") {
-        tasks.push(readAnalysis(account, reload));
-        if (typeof Chart !== "function" && (!chartError || reload)) tasks.push(loadCharts());
-      } else if (page.query) {
-        const list = pagedList(page.query, account);
-        tasks.push(list.load(reload));
-      }
+      if (page.load) tasks.push(page.load(reload));
     }
     renderPage();
     try { await settleLoads(tasks); } catch (error) {
@@ -756,7 +769,7 @@ function renderDataNotice() {
   if (!page) return;
   const account = currentRole === "account";
   // Paged lists display their own loading and error states.
-  const listQuery = pagedLists[currentRole][page.query]?.query;
+  const listQuery = page.list?.query;
   const visible = page.sources.filter((source) => source !== listQuery);
   const errors = visible.filter((source) => source.error).map((source) =>
     m("ui.resource_error", {

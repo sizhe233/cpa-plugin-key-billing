@@ -40,9 +40,10 @@ function renderAccountModels() {
   const directory = data.models.value;
   const modelScope = new Set(access.models.map((model) => model.toLowerCase()));
   const deniedModels = new Set((access.denied_models || []).map((model) => model.toLowerCase()));
+  // A host that filters model catalogs has already applied every rule to the key's directory.
   const models = (
-    access.routing_valid === false
-      ? []
+    access.catalog_filtered
+      ? directory
       : !modelScope.size ? directory : directory.length ? directory.filter((model) => modelScope.has(model.toLowerCase())) : access.models
   )
     .filter((model) => !deniedModels.has(model.toLowerCase()))
@@ -59,7 +60,6 @@ function renderAccountRouting() {
 }
 
 function renderAccountAccess(access) {
-  const routingValid = access.routing_valid !== false;
   const accountCredentialLabel = (item, state) => {
     const name = window.billingI18n.serverMessage(item.name_message, item.name);
     return {
@@ -67,7 +67,7 @@ function renderAccountAccess(access) {
         ? credentialProviderLabel(item)
         : item.status === "missing"
           ? name ? maskedLabelText(name) : m("ui.the_selected_upstream_credential_is_currently_unavailable")
-          : maskedTailText(item.provider, name || m("ui.credential_unavailable")),
+          : maskedTailText(item.provider_name, name || m("ui.credential_unavailable")),
       tag: item.provider_wide ? m("ui.entire_category") : "",
       iconName: credentialIcon(item),
       state: item.denied ? "deny" : state
@@ -79,12 +79,14 @@ function renderAccountAccess(access) {
     state: deniedModels.has(text.toLowerCase()) ? "deny" : "allow",
     iconName: "astroid"
   }));
-  if (!modelItems.length) modelItems.push({ text: routingValid ? m("ui.all_models") : m("ui.unknown"), iconName: "astroid" });
+  const allModels =
+    access.credentials.length || access.denied_credentials.length ? m("ui.all_models_within_credential_access") : m("ui.all_models");
+  if (!modelItems.length) modelItems.push({ text: allModels, iconName: "astroid" });
   for (const text of access.denied_models || [])
     if (!access.models.some((model) => model.toLowerCase() === text.toLowerCase()))
       modelItems.push({ text, state: "deny", iconName: "astroid" });
   const credentialItems = access.credentials.map((item) => accountCredentialLabel(item, "allow"));
-  if (!credentialItems.length) credentialItems.push({ text: routingValid ? m("ui.all_credentials") : m("ui.unknown") });
+  if (!credentialItems.length) credentialItems.push({ text: m("ui.all_credentials") });
   const credentialKey = (item) => JSON.stringify([item.source, item.provider, !!item.provider_wide, item.name]);
   const deniedCredentials = new Set(access.credentials.filter((item) => item.denied).map(credentialKey));
   for (const item of access.denied_credentials || []) {
@@ -145,13 +147,16 @@ function renderAccountModel(model) {
       "div",
       { class: "account-model-price-row" + (longContext ? " tiered" : "") },
       el("span", { class: "account-model-price-label" }, item.label),
-      el("strong", { class: "mono account-model-base-price" }, item.base == null ? "—" : usd(item.base)),
+      el("strong", { class: "mono account-model-base-price" }, item.base == null ? "—" : money(item.base, price.currency)),
       longContext
         ? el(
             "span",
             { class: "account-model-long-price" },
             item.long != null
-              ? [el("span", { class: "account-model-threshold" }, threshold), el("strong", { class: "mono" }, usd(item.long))]
+              ? [
+                  el("span", { class: "account-model-threshold" }, threshold),
+                  el("strong", { class: "mono" }, money(item.long, price.currency))
+                ]
               : el("span", { class: "muted" }, "—")
           )
         : null
@@ -162,6 +167,11 @@ function renderAccountModel(model) {
     el("b", { class: "mono account-model-name", "data-tip": model, "data-tip-overflow": "" }, model),
     price
       ? el("div", { class: "account-model-price-list" }, priceRows.map(priceRow))
-      : el("span", { class: "muted small", text: m("ui.no_price_configured_currently_unavailable") })
+      : el("span", {
+          class: "muted small",
+          text: resources.account.profile.value.can_use_unpriced_models
+            ? m("ui.no_price_configured_not_billed")
+            : m("ui.no_price_configured_currently_unavailable")
+        })
   );
 }

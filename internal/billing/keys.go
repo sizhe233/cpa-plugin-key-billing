@@ -1,7 +1,8 @@
 package billing
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -13,11 +14,12 @@ type KeyView struct {
 	InConfig  bool      `json:"in_config"`
 	DeletedAt time.Time `json:"deleted_at,omitzero"`
 
-	PlanID             string        `json:"plan_id,omitempty"`
-	PlanName           string        `json:"plan_name,omitempty"`
-	ConcurrencyLimit   int           `json:"concurrency_limit"`
-	CurrentConcurrency int           `json:"current_concurrency"`
-	RouteBindings      RouteBindings `json:"route_bindings"`
+	PlanID             string            `json:"plan_id,omitempty"`
+	PlanName           string            `json:"plan_name,omitempty"`
+	ConcurrencyLimit   int               `json:"concurrency_limit"`
+	CurrentConcurrency int               `json:"current_concurrency"`
+	RouteBindings      RouteBindings     `json:"route_bindings"`
+	RouteNames         map[string]string `json:"route_names"`
 	QuotaView
 }
 
@@ -26,26 +28,29 @@ func (s *Store) KeyViews() []KeyView {
 	now := s.Now()
 	return updateResult(s, func(state *State) ([]KeyView, Changes) {
 		var settled []string
-		plans := make(map[string]Plan, len(state.Plans))
-		for _, plan := range state.Plans {
-			plans[plan.ID] = plan
-		}
 		views := make([]KeyView, 0, len(state.Keys))
 		for scope, key := range state.Keys {
 			if key == nil {
 				continue
 			}
-			if key.DeletedAt.IsZero() && settleKeyPlan(key, plans[key.PlanID], now) {
+			if key.DeletedAt.IsZero() && settleExpiredCycles(key, now) {
 				settled = append(settled, scope)
 			}
-			views = append(views, keyView(scope, key, plans[key.PlanID], s.activeByScope[scope], now))
+			views = append(views, s.keyView(state, scope, key, now))
 		}
-		sortKeyViews(views)
+		sortKeyViews(views, s.configOrder)
 		return views, Changes{Keys: settled}
 	})
 }
 
-func keyView(scope string, key *KeyState, plan Plan, currentConcurrency int, now time.Time) KeyView {
+// keyView needs the store lock for its concurrency and exchange rate.
+func (s *Store) keyView(state *State, scope string, key *KeyState, now time.Time) KeyView {
+	plan, _ := state.FindPlan(key.PlanID)
+	routeNames := make(map[string]string, len(key.RouteBindings.RouteIDs))
+	for _, id := range key.RouteBindings.RouteIDs {
+		route, _ := state.findRoute(id)
+		routeNames[id] = route.Name
+	}
 	return KeyView{
 		Scope:              scope,
 		Preview:            key.Preview,
@@ -54,23 +59,12 @@ func keyView(scope string, key *KeyState, plan Plan, currentConcurrency int, now
 		DeletedAt:          key.DeletedAt,
 		PlanID:             key.PlanID,
 		PlanName:           plan.Name,
-		QuotaView:          quotaView(key, plan, now),
+		QuotaView:          quotaView(key, plan, s.cfg.CNYPerUSD, now),
 		ConcurrencyLimit:   key.ConcurrencyLimit,
-		CurrentConcurrency: currentConcurrency,
+		CurrentConcurrency: s.activeByScope[scope],
 		RouteBindings:      key.RouteBindings.clone(),
+		RouteNames:         routeNames,
 	}
-}
-
-func settleKeyPlan(key *KeyState, plan Plan, now time.Time) bool {
-	if key.PlanID == "" {
-		return false
-	}
-	if plan.ID == key.PlanID {
-		return settleExpiredCycles(key, now)
-	}
-	key.PlanID = ""
-	key.Cycles = nil
-	return true
 }
 
 func (s *Store) KeyViewForScope(scope string) (KeyView, bool) {
@@ -87,27 +81,31 @@ func (s *Store) KeyViewForScope(scope string) (KeyView, bool) {
 		if key == nil || !key.DeletedAt.IsZero() {
 			return result{}, Changes{}
 		}
-		plan, _ := state.FindPlan(key.PlanID)
 		now := s.Now()
 		changed := Changes{}
-		if settleKeyPlan(key, plan, now) {
+		if settleExpiredCycles(key, now) {
 			changed.Keys = []string{scope}
 		}
-		return result{view: keyView(scope, key, plan, s.activeByScope[scope], now), ok: true}, changed
+		return result{view: s.keyView(state, scope, key, now), ok: true}, changed
 	})
 	return current.view, current.ok
 }
 
-func sortKeyViews(views []KeyView) {
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].Blocked != views[j].Blocked {
-			return views[i].Blocked
+// Keys CPA holds keep their configuration order, as its panels list them; the
+// rest follow by label.
+func sortKeyViews(views []KeyView, configOrder map[string]int) {
+	rank := func(scope string) int {
+		if position, listed := configOrder[scope]; listed {
+			return position
 		}
-		left, right := strings.ToLower(views[i].Label), strings.ToLower(views[j].Label)
-		if left != right {
-			return left < right
-		}
-		return views[i].Scope < views[j].Scope
+		return len(configOrder)
+	}
+	slices.SortFunc(views, func(a, b KeyView) int {
+		return cmp.Or(
+			cmp.Compare(rank(a.Scope), rank(b.Scope)),
+			cmp.Compare(strings.ToLower(a.Label), strings.ToLower(b.Label)),
+			cmp.Compare(a.Scope, b.Scope),
+		)
 	})
 }
 
@@ -225,6 +223,20 @@ func (s *Store) SetLabel(scope, label string) error {
 	return err
 }
 
+// LiveScope returns the first scope that names a live key, or "".
+func (s *Store) LiveScope(scopes []string) string {
+	result := ""
+	s.read(func(state *State) {
+		for _, scope := range scopes {
+			if scope = normalizeScope(scope); state.liveKey(scope) != nil {
+				result = scope
+				return
+			}
+		}
+	})
+	return result
+}
+
 // Deleted keys retain their settings but cannot be rebound or reset.
 func (s *State) liveKey(scope string) *KeyState {
 	key := s.Keys[scope]
@@ -269,12 +281,14 @@ func (s *State) ensureKey(scope, preview string) *KeyState {
 // and explicit resets still apply.
 func (s *Store) SyncKeys(keys []string, allowEmpty bool) (SyncResult, error) {
 	scopes := make(map[string]string, len(keys))
+	order := make(map[string]int, len(keys))
 	for _, key := range keys {
 		scope := CallerScope(key)
-		if scope == "" {
+		if _, listed := scopes[scope]; scope == "" || listed {
 			continue
 		}
 		scopes[scope] = PreviewKey(key)
+		order[scope] = len(order)
 	}
 	if len(scopes) == 0 && !allowEmpty {
 		return SyncResult{}, invalidf("The API key list is empty; pass allow_empty to clear it")
@@ -282,7 +296,7 @@ func (s *Store) SyncKeys(keys []string, allowEmpty bool) (SyncResult, error) {
 
 	now := s.Now()
 
-	return editConfiguration(s, func(state *State) (SyncResult, Changes, error) {
+	result, err := editConfiguration(s, func(state *State) (SyncResult, Changes, error) {
 		var result SyncResult
 		changed := false
 		for scope, preview := range scopes {
@@ -319,6 +333,12 @@ func (s *Store) SyncKeys(keys []string, allowEmpty bool) (SyncResult, error) {
 		}
 		return result, Changes{AllKeys: true}, nil
 	})
+	if err == nil {
+		s.mu.Lock()
+		s.configOrder = order
+		s.mu.Unlock()
+	}
+	return result, err
 }
 
 // Scopes are hex digests, so case folding is safe for hand-typed input.

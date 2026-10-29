@@ -22,6 +22,7 @@ const (
 	routeProfile                = "/profile"
 	routeSubscription           = "/subscription"
 	routeRouting                = "/routing"
+	routeCurrency               = "/currency"
 	routePrices                 = "/prices"
 	routeReferencePrices        = "/prices/reference"
 	routeReferencePricesStatus  = "/prices/reference/status"
@@ -40,10 +41,16 @@ const (
 	routeEventKeys              = "/events/keys"
 	routeErrors                 = "/errors"
 	routeAnalysis               = "/analysis"
+	routeAnalysisSpeed          = "/analysis/speed"
 	routePluginLogs             = "/plugin-logs"
 	routeAuthFiles              = "/auth-files"
 	routeAuthQuota              = "/auth-files/quota"
 	routeAuthQuotaReset         = "/auth-files/quota/reset"
+	routeAuthFileHistory        = "/auth-files/history"
+	routeUsageModels            = "/usage/models"
+	routeAIProviders            = "/ai-providers"
+	routeAIProviderBalance      = "/ai-providers/balance"
+	routeAIProviderNote         = "/ai-providers/note"
 )
 
 type managementEndpoint struct {
@@ -62,6 +69,7 @@ var managementEndpoints = []managementEndpoint{
 		return JSONResponse(http.StatusOK, map[string]any{"routes": a.routeRows()})
 	}},
 	{http.MethodGet, routeCredentials, "View routing credential options", (*App).listCredentials},
+	{http.MethodGet, routeCurrency, "View the exchange rate", func(a *App, req ManagementRequest) ManagementResponse { return a.currency(req, viewAccess{}) }},
 	{http.MethodGet, routePrices, "View model pricing", func(a *App, req ManagementRequest) ManagementResponse { return a.listPrices(req, viewAccess{}) }},
 	{http.MethodGet, routeReferencePrices, "Search model reference prices", (*App).searchReferencePrices},
 	{http.MethodGet, routeReferencePricesStatus, "View reference price status", func(a *App, _ ManagementRequest) ManagementResponse { return a.referencePriceStatus() }},
@@ -90,11 +98,23 @@ var managementEndpoints = []managementEndpoint{
 		return a.listRequestErrors(req, viewAccess{})
 	}},
 	{http.MethodGet, routeAnalysis, "View usage distribution", func(a *App, req ManagementRequest) ManagementResponse { return a.analysis(req, viewAccess{}) }},
+	{http.MethodGet, routeAnalysisSpeed, "View model speed trends", func(a *App, req ManagementRequest) ManagementResponse {
+		return a.analysisSpeed(req, viewAccess{})
+	}},
 	{http.MethodGet, routePluginLogs, "List plugin logs with pagination", (*App).listPluginLogs},
 	{http.MethodDelete, routePluginLogs, "Clear plugin logs", func(a *App, _ ManagementRequest) ManagementResponse { return a.clearPluginLogs() }},
-	{http.MethodGet, routeAuthFiles, "View auth files", func(a *App, _ ManagementRequest) ManagementResponse { return a.authFiles(viewAccess{}) }},
+	{http.MethodGet, routeAuthFiles, "View auth files", func(a *App, req ManagementRequest) ManagementResponse { return a.authFiles(req, viewAccess{}) }},
 	{http.MethodGet, routeAuthQuota, "Query auth file quotas", func(a *App, req ManagementRequest) ManagementResponse { return a.authQuota(req, viewAccess{}) }},
 	{http.MethodPost, routeAuthQuotaReset, "Reset auth file quotas", func(a *App, req ManagementRequest) ManagementResponse { return a.authQuotaReset(req, viewAccess{}) }},
+	{http.MethodGet, routeAuthFileHistory, "View 30-day auth file usage and quota periods", func(a *App, req ManagementRequest) ManagementResponse {
+		return a.authFileHistory(req, viewAccess{})
+	}},
+	{http.MethodGet, routeUsageModels, "View usage by model", func(a *App, req ManagementRequest) ManagementResponse {
+		return a.usageModels(req, viewAccess{})
+	}},
+	{http.MethodGet, routeAIProviders, "View configured AI providers", func(a *App, req ManagementRequest) ManagementResponse { return a.aiProviders(req, viewAccess{}) }},
+	{http.MethodPost, routeAIProviderNote, "Set AI provider note", (*App).setAIProviderNote},
+	{http.MethodPost, routeAIProviderBalance, "Sync AI provider balance", (*App).syncAIProviderBalance},
 }
 
 type resourceEndpoint struct {
@@ -112,13 +132,18 @@ var resourceEndpoints = []resourceEndpoint{
 	{routeRouting, func(a *App, _ ManagementRequest, access viewAccess) ManagementResponse {
 		return a.accountRouting(access)
 	}},
+	{routeCurrency, (*App).currency},
 	{routePrices, (*App).listPrices},
 	{routeAnalysis, (*App).analysis},
+	{routeAnalysisSpeed, (*App).analysisSpeed},
 	{routeEvents, (*App).listRequestEvents},
 	{routeErrors, (*App).listRequestErrors},
-	{routeAuthFiles, func(a *App, _ ManagementRequest, access viewAccess) ManagementResponse { return a.authFiles(access) }},
+	{routeAuthFiles, (*App).authFiles},
 	{routeAuthQuota, (*App).authQuota},
 	{routeAuthQuotaReset, (*App).authQuotaReset},
+	{routeAuthFileHistory, (*App).authFileHistory},
+	{routeUsageModels, (*App).usageModels},
+	{routeAIProviders, (*App).aiProviders},
 }
 
 func managementRegistration() ManagementRegistrationResponse {
@@ -184,6 +209,54 @@ func (a *App) routeManagement(req ManagementRequest, suffix string) ManagementRe
 		}
 	}
 	return JSONError(http.StatusNotFound, "not_found", "Management route not found: "+req.Method+" "+req.Path)
+}
+
+// Mutation views use local state, never host discovery.
+func (a *App) mutateWithView(req ManagementRequest, path string, handle func(*App, ManagementRequest) ManagementResponse) ManagementResponse {
+	var input struct {
+		Data   json.RawMessage `json:"data"`
+		Models []string        `json:"models,omitempty"`
+	}
+	if err := decodeStrict(req.Body, &input); err != nil {
+		return errorResponse(err)
+	}
+	for _, model := range input.Models {
+		if len(strings.TrimSpace(model)) > 1024 {
+			return JSONError(http.StatusBadRequest, "invalid", "Model ID is too long")
+		}
+	}
+	req.Body = input.Data
+	response := handle(a, req)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return response
+	}
+	view := map[string]any{}
+	switch path {
+	case routePlans, routeRoutes, routeKeysBind, routeKeysUnbind, routeKeysReset, routeKeysLabel, routeKeysConcurrency, routeKeysRoutes:
+		view["keys"] = a.keyRows()
+		if path == routePlans {
+			view["plans"] = a.store.Plans()
+		}
+		if path == routeRoutes || path == routeKeysRoutes {
+			view["routes"] = a.routeRows()
+		}
+	case routePrices, routeReferencePricesRefresh:
+		prices, err := a.store.ModelPriceRows(input.Models, true)
+		if err != nil {
+			// The write has committed. A display-read failure must not turn it into
+			// a reported write failure or invite the caller to repeat the mutation.
+			view["error"] = err.Error()
+		} else {
+			view["prices"] = prices
+		}
+		view["metadata"] = a.store.ReferencePriceMetadata()
+	case routePluginLogs:
+		view["logs_cleared"] = true
+	}
+	var result map[string]json.RawMessage
+	_ = json.Unmarshal(response.Body, &result)
+	result["view"], _ = json.Marshal(view)
+	return JSONResponse(response.StatusCode, result)
 }
 
 func errorResponse(err error) ManagementResponse {

@@ -12,8 +12,14 @@ type Repository interface {
 	EventKeys(from, to, since time.Time) ([]EventKey, error)
 	RequestEvents(query RequestEventQuery, since time.Time) (RequestEventView, error)
 	RequestErrors(query RequestErrorQuery, since time.Time) (RequestErrorView, error)
-	Analysis(query RequestEventQuery, since time.Time) (AnalysisView, error)
-	CredentialUsage(authIndexes []string, scope string, since time.Time) (map[string]CredentialUsage, error)
+	Analysis(query RequestEventQuery, rate ExchangeRate, since time.Time) (AnalysisView, error)
+	AnalysisSpeed(query RequestEventQuery, since time.Time) (AnalysisSpeedView, error)
+	CredentialUsageStats(authIndexes []string, scope string, from, to time.Time, rate ExchangeRate) (map[string]CredentialUsageStats, error)
+	LatestQuotaReports(authIndexes []string, since time.Time) (map[string][]QuotaObservation, error)
+	QuotaWindowHistories(authIndex, provider string, from, to time.Time) ([]QuotaWindowHistory, error)
+	UsageTotal(scope string, query UsageQuery, rate ExchangeRate) (UsageTotal, error)
+	UsageByModel(scope string, query UsageQuery, rate ExchangeRate) ([]ModelUsage, error)
+	UsageSources(scope string, query UsageQuery) ([]string, error)
 
 	AppendPluginLog(entry PluginLog, cutoff time.Time) error
 	PluginLogsPage(query PluginLogQuery) (PluginLogPage, error)

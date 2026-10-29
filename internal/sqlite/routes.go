@@ -13,11 +13,8 @@ func replaceRoutes(tx *sql.Tx, state *billing.State) error {
 		return fmt.Errorf("Save routing rules: %w", err)
 	}
 	for position, route := range state.Routes {
-		raw, err := json.Marshal(route.Rule)
-		if err != nil {
-			return fmt.Errorf("Save routing rule %s: %w", route.ID, err)
-		}
-		if _, err = tx.Exec("INSERT INTO routes (position, id, name, rule_json) VALUES (?, ?, ?, ?)", position, route.ID, route.Name, string(raw)); err != nil {
+		raw, _ := json.Marshal(route.Rule)
+		if _, err := tx.Exec("INSERT INTO routes (position, id, name, rule_json) VALUES (?, ?, ?, ?)", position, route.ID, route.Name, string(raw)); err != nil {
 			return fmt.Errorf("Save routing rule %s: %w", route.ID, err)
 		}
 	}

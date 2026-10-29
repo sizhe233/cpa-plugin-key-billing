@@ -22,7 +22,7 @@ func TestDescriptorsPreserveArgumentsAndWrappedErrors(t *testing.T) {
 }
 
 func TestRawErrorsAreNotTranslatedByTextOrUnwrappedPastContext(t *testing.T) {
-	raw := errors.New("No email provided") // Coincides with a built-in label.
+	raw := errors.New("No API key configured") // Coincides with a built-in label.
 	if detail := FromError(raw); detail.Key != "" || detail.Text != raw.Error() {
 		t.Fatalf("raw upstream error was treated as plugin copy: %+v", detail)
 	}

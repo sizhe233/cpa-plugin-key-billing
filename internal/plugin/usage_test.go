@@ -72,6 +72,28 @@ func TestUsageBreakdownMatchesCurrentHostSemantics(t *testing.T) {
 				Output: billing.TokenOutputBreakdown{TotalTokens: 5, NonReasoningTokens: 2, ReasoningTokens: 3},
 			},
 		},
+		{
+			name: "Meta Responses accounting",
+			record: UsageRecord{Provider: "meta", ExecutorType: "MetaExecutor", Detail: UsageDetail{
+				InputTokens: 100, CacheReadTokens: 40, OutputTokens: 50, ReasoningTokens: 20, TotalTokens: 150,
+			}},
+			want: billing.TokenBreakdown{
+				Quality: billing.TokenAccountingComplete, TotalTokens: 150,
+				Input:  billing.TokenInputBreakdown{TotalTokens: 100, UncachedTokens: 60, CacheReadTokens: 40},
+				Output: billing.TokenOutputBreakdown{TotalTokens: 50, NonReasoningTokens: 30, ReasoningTokens: 20},
+			},
+		},
+		{
+			name: "Devin Interactions accounting",
+			record: UsageRecord{Provider: "devin", ExecutorType: "DevinExecutor", Detail: UsageDetail{
+				InputTokens: 100, CacheReadTokens: 40, OutputTokens: 50, ReasoningTokens: 20, TotalTokens: 170,
+			}},
+			want: billing.TokenBreakdown{
+				Quality: billing.TokenAccountingComplete, TotalTokens: 170,
+				Input:  billing.TokenInputBreakdown{TotalTokens: 100, UncachedTokens: 60, CacheReadTokens: 40},
+				Output: billing.TokenOutputBreakdown{TotalTokens: 70, NonReasoningTokens: 50, ReasoningTokens: 20},
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -84,11 +106,20 @@ func TestUsageBreakdownMatchesCurrentHostSemantics(t *testing.T) {
 }
 
 func TestUsageBreakdownHandlesUnknownOrContradictoryRecords(t *testing.T) {
-	unknown := usageBreakdown(UsageRecord{Provider: "future-provider", Detail: UsageDetail{
+	// Every semantics agrees when no count depends on it, as with plain plugin executor usage.
+	agreed := usageBreakdown(UsageRecord{Provider: "freetier", ExecutorType: "executorAdapter", Detail: UsageDetail{
 		InputTokens: 100, OutputTokens: 20, TotalTokens: 120,
 	}})
-	if unknown.Quality != billing.TokenAccountingUnclassified || unknown.UnclassifiedTokens != 120 || unknown.Billable() {
-		t.Fatalf("unknown breakdown = %+v", unknown)
+	if agreed.Quality != billing.TokenAccountingComplete || agreed.Input.UncachedTokens != 100 ||
+		agreed.Output.NonReasoningTokens != 20 || !agreed.Billable() {
+		t.Fatalf("agreed breakdown = %+v", agreed)
+	}
+	// Without a total, reasoning may be part of the output or separate from it.
+	ambiguous := usageBreakdown(UsageRecord{Provider: "future-provider", Detail: UsageDetail{
+		InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5,
+	}})
+	if ambiguous.Quality != billing.TokenAccountingUnclassified || ambiguous.Billable() {
+		t.Fatalf("ambiguous breakdown = %+v", ambiguous)
 	}
 	unknownRemainder := usageBreakdown(UsageRecord{Provider: "future-provider", Detail: UsageDetail{
 		InputTokens: 100, OutputTokens: 20, TotalTokens: 125,

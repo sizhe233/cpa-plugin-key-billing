@@ -73,6 +73,15 @@ func maskAPIKeyPayload(payload any) (any, bool) {
 			value.Entries[i].Account = maskEmails(value.Entries[i].Account)
 			value.Entries[i].Source = maskEmails(value.Entries[i].Source)
 			value.Entries[i].ErrorBody = maskEmails(value.Entries[i].ErrorBody)
+			if execution := value.Entries[i].Execution; execution != nil {
+				masked := *execution
+				masked.RequestID = maskEmails(masked.RequestID)
+				masked.TraceID = maskEmails(masked.TraceID)
+				masked.SessionID = maskEmails(masked.SessionID)
+				masked.ParentSessionID = maskEmails(masked.ParentSessionID)
+				masked.AccessProvider = maskEmails(masked.AccessProvider)
+				value.Entries[i].Execution = &masked
+			}
 		}
 		if value.Filters != nil {
 			for i := range value.Filters.SourceOptions {
@@ -100,7 +109,7 @@ func maskAPIKeyPayload(payload any) (any, bool) {
 	case authFileListResponse:
 		for i := range value.Files {
 			value.Files[i].Name = maskEmails(value.Files[i].Name)
-			value.Files[i].Email = maskEmails(value.Files[i].Email)
+			value.Files[i].Title = maskEmails(value.Files[i].Title)
 			value.Files[i].QuotaReason = maskEmails(value.Files[i].QuotaReason)
 			value.Files[i].QuotaReasonMessage = maskMessage(value.Files[i].QuotaReasonMessage)
 		}
@@ -115,7 +124,7 @@ func maskAPIKeyPayload(payload any) (any, bool) {
 			value.Quota[i].GroupMessage = maskMessage(value.Quota[i].GroupMessage)
 		}
 		return value, true
-	case []billing.PriceRow:
+	case []billing.PriceRow, billing.AnalysisSpeedView:
 		return value, true
 	default:
 		return payload, false

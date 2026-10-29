@@ -167,7 +167,7 @@ func TestOpenRollsBackOnIndexNameCollision(t *testing.T) {
 			}
 			before, version := indexDefinitions(t, d), ddlVersion(t, d)
 			events := mustQueryRequestEvents(t, d, billing.RequestEventQuery{})
-			if reopened, err := Open(d.path); err == nil {
+			if reopened, err := Open(d.path, nil); err == nil {
 				reopened.Close()
 				t.Fatal("replaced an incompatible object")
 			}

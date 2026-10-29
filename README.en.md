@@ -14,6 +14,7 @@
 ## Features
 
 - Set spending, token, and request quotas for each API key, with independent or shared reset schedules.
+- Price models and subscription plans in USD or CNY, and view usage statistics in either currency.
 - Apply separate rates to requests that exceed a long-context input threshold.
 - Limit concurrent requests per API key.
 - Control access to models and upstream credentials with routing rules.
@@ -47,7 +48,7 @@ flowchart TB
 
 ## Requirements
 
-- CLIProxyAPI **7.2.143 or later**.
+- CLIProxyAPI **7.3.7 or later**. [Model list filtering](#model-lists) requires **8.0.37 or later**.
 - A CLIProxyAPI build with plugin support. Builds labeled `no-plugin` cannot load this plugin.
 
 ## Installation
@@ -87,12 +88,25 @@ plugins:
   configs:
     cpa-key-billing:
       enabled: true
+      priority: 100 # Plugin scheduling priority; higher values take precedence
       debug: false # Include routing and reference-price matching in debug logs
       codex_fast_mode_billing: false # Charge 2.5× for Codex priority requests
+      allow_unpriced_models: false # Admit requests for unpriced models and record their usage at zero cost
+      cny_per_usd: 7 # Exchange rate in CNY per USD, used to convert amounts between currencies
       mask_api_key_view_emails: false # Mask email addresses in API key account views
       allow_api_key_quota_reset: false # Allow API key users to reset accessible Codex and Claude auth file quotas using upstream resets
       state_file: "plugins/cpa-key-billing-state-v1.db"
+      routing:
+        strategy: "round-robin" # round-robin, weighted-round-robin, fill-first
+        session-affinity: false # Reuse an available upstream credential for the same session
+        session-affinity-ttl: "1h" # Idle timeout for session bindings
 ```
+
+For requests with upstream credential restrictions, the plugin selects from the allowed credentials using the `routing` configuration above. Requests without upstream credential restrictions are handed to CPA for scheduling. The plugin's scheduling configuration is independent of CPA's global `routing` configuration.
+
+CPA selects one scheduling plugin by priority rather than calling them in sequence. Set `priority: 100` to give this plugin precedence; omitting it uses CPA's default of `0`. The selected credential must satisfy the API key's routing rules regardless of which scheduler selected it. Requests return `503` if the credential violates those rules or its permissions cannot be verified, with the reason recorded in the plugin logs.
+
+For initial selections or invalid session bindings, the plugin uses the highest available priority tier, then applies the selected strategy. With session affinity enabled, the same session reuses its bound credential while it remains available. Bindings expire after the idle period specified by `session-affinity-ttl`. Affinity requires a session identity supplied by CPA; requests without one follow the selected strategy.
 
 > [!WARNING]
 > Back up your data file before upgrading.
@@ -100,7 +114,7 @@ plugins:
 > - Databases created by v1.0.0 or later are migrated automatically.
 > - JSON and SQLite files from v0.8.4 or earlier cannot be migrated. Point `state_file` to a new file instead.
 
-Restart CLIProxyAPI and open **API Key Billing** in the management panel. Review model pricing, create subscription plans, and bind the API keys whose quotas you want to enforce.
+Restart CLIProxyAPI and open **CPA Key Billing** in the management panel. Review model pricing, create subscription plans, and bind the API keys whose quotas you want to enforce.
 
 ## Access
 
@@ -119,10 +133,12 @@ http(s)://<CLIProxyAPI address>/v0/resource/plugins/cpa-key-billing/ui#account
 ## Billing and quotas
 
 - Keys without a subscription plan still have their usage recorded, but have no subscription quota limit.
-- A plan can contain multiple quota windows. Each window can limit spending in USD, tokens, requests, or any combination of the three.
+- A plan can contain multiple quota windows. Each window can limit spending, tokens, requests, or any combination of the three.
 - Usage is tracked separately for each key, even when keys share a plan. Independent cycles start when the first request is admitted. Shared cycles use the configured schedule for every bound key.
 - A manual quota reset keeps shared reset times unchanged. Independent cycles restart when the next request is admitted.
-- Custom model prices take precedence over models.dev reference prices. Requests are rejected if neither is available.
+- Custom model prices take precedence over models.dev reference prices. Requests without any available price are rejected; with `allow_unpriced_models`, they are admitted and their usage is recorded at zero cost, while every other quota and routing limit still applies.
+- Each custom price and subscription plan is in USD or CNY; built-in and reference prices are in USD. A request's cost stays in the currency of the price it used. A plan's spending quota counts in the plan's currency and converts other currencies at `cny_per_usd`. Changing the rate or a plan's currency never rewrites recorded amounts; quota usage converts at the current rate.
+- The analysis, request event, auth file, and AI provider pages can show amounts in a chosen currency. The default, Auto, keeps each figure in the currency it was charged in and shows a mix of currencies in USD.
 - Request events are retained for 365 days.
 
 ## Routing rules
@@ -155,6 +171,10 @@ flowchart TB
     P -- No match --> S[HTTP 503]
 ```
 
+### Model lists
+
+On CLIProxyAPI 8.0.37 or later, the model list an API key receives contains only models its routing rules allow and an allowed credential serves, so clients no longer show models they cannot call. Older CLIProxyAPI versions still return the full model list.
+
 ## Rejection responses
 
 | Condition | HTTP status | `type` | `code` |
@@ -162,9 +182,10 @@ flowchart TB
 | Concurrency limit reached | `429` | `rate_limit_error` | `rate_limit_exceeded` |
 | Subscription quota exhausted | `429` | `rate_limit_error` | `rate_limit_exceeded` |
 | Model access denied | `403` | `permission_error` | `insufficient_quota` |
-| No available credential matches the routing rules | `503` | `server_error` | `internal_server_error` |
-| A bound routing rule is missing or invalid | `503` | `server_error` | `routing_configuration_error` |
-| Model has no price | `503` | `cpa_key_billing_error` | `model_price_error` |
+| The credentials the routing rules allow do not serve the model, or none is available | `503` | `server_error` | `internal_server_error` |
+| The selected credential violates the routing rules | `503` | `server_error` | `routing_credential_mismatch` |
+| The selected credential's routing permissions cannot be verified | `503` | `server_error` | `routing_credential_unverified` |
+| Model has no price and `allow_unpriced_models` is disabled | `503` | `cpa_key_billing_error` | `model_price_error` |
 
 ## Acknowledgments
 
