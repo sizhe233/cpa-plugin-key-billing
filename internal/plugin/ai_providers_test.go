@@ -65,7 +65,7 @@ func TestAIProviderViewsScopeUsageAndRouting(t *testing.T) {
 		if err := app.store.SetKeyRoutes(billing.CallerScope(accountTestKeyA), billing.RouteBindings{RouteRule: rule}); err != nil {
 			t.Fatal(err)
 		}
-		response := callAccount(t, app, routeAIProviders, accountTestKeyA, query)
+		response := callAccountDirect(t, app, routeAIProviders, accountTestKeyA, query)
 		var account aiProviderListResponse
 		if err := json.Unmarshal(response.Body, &account); err != nil || response.StatusCode != http.StatusOK || len(account.Providers) != 1 {
 			t.Fatalf("account providers: %s, %v", response.Body, err)
@@ -78,7 +78,7 @@ func TestAIProviderViewsScopeUsageAndRouting(t *testing.T) {
 			t.Fatalf("account usage = %+v", got.Usage)
 		}
 		query.Set("credential_ref", refA)
-		response = callAccount(t, app, routeUsageModels, accountTestKeyA, query)
+		response = callAccountDirect(t, app, routeUsageModels, accountTestKeyA, query)
 		var models struct {
 			Models []billing.ModelUsage `json:"models"`
 		}
@@ -86,12 +86,12 @@ func TestAIProviderViewsScopeUsageAndRouting(t *testing.T) {
 			t.Fatalf("account model usage = %s, %v", response.Body, err)
 		}
 		query.Set("credential_ref", refB)
-		if response = callAccount(t, app, routeUsageModels, accountTestKeyA, query); response.StatusCode != http.StatusNotFound {
+		if response = callAccountDirect(t, app, routeUsageModels, accountTestKeyA, query); response.StatusCode != http.StatusNotFound {
 			t.Fatalf("denied model usage = %s", response.Body)
 		}
 		query.Del("credential_ref")
 	}
-	if response := callAccount(t, app, routeAIProviders, "sk-untracked", query); response.StatusCode != http.StatusUnauthorized {
+	if response := callAccountDirect(t, app, routeAIProviders, "sk-untracked", query); response.StatusCode != http.StatusUnauthorized {
 		t.Fatal(response.StatusCode)
 	}
 	if response := callAccount(t, app, routeAIProviderBalance, accountTestKeyA, nil); response.StatusCode != http.StatusNotFound {

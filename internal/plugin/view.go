@@ -89,10 +89,11 @@ func (a *App) routeResource(req ManagementRequest, suffix string) ManagementResp
 			break
 		}
 	}
-	// sizhe233 hardening: API-key holders never reach auth files. These routes
-	// read full credential JSON (host.auth.get) and call upstream quota/reset
-	// endpoints with operator credentials; keep them Management-API only.
-	if handler == nil || apiKeyBlockedResource(suffix) {
+	// sizhe233 hardening: API-key holders never reach auth files or configured
+	// AI providers. These routes read credential records from the host, call
+	// upstream quota/reset endpoints with operator credentials, or list provider
+	// names, base URLs, key previews and balances; keep them Management-API only.
+	if handler == nil || apiKeyBlockedResource(suffix, req.Query) {
 		return apiKeyJSONError(http.StatusNotFound, "not_found", "Resource route not found: "+req.Method+" "+req.Path)
 	}
 	access, ok := a.apiKeyViewAccess(req)
@@ -486,10 +487,14 @@ func (a *App) eventKeys(req ManagementRequest) ManagementResponse {
 	return JSONResponse(http.StatusOK, keys)
 }
 
-func apiKeyBlockedResource(suffix string) bool {
+func apiKeyBlockedResource(suffix string, query url.Values) bool {
 	switch suffix {
-	case routeAuthFiles, routeAuthQuota, routeAuthQuotaReset:
+	case routeAuthFiles, routeAuthQuota, routeAuthQuotaReset, routeAuthFileHistory, routeAIProviders:
 		return true
+	case routeUsageModels:
+		// The account analysis breakdown (dimension/value over the caller's own
+		// requests) stays available; per-credential breakdowns do not.
+		return query.Has("auth_index") || query.Has("credential_ref")
 	default:
 		return false
 	}

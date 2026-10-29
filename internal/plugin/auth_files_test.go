@@ -188,7 +188,7 @@ func TestAuthFilesStatisticsFollowTimeRangeAndAccountScope(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var response ManagementResponse
 			if tc.key != "" {
-				response = callAccount(t, app, routeAuthFiles, tc.key, tc.query)
+				response = callAccountDirect(t, app, routeAuthFiles, tc.key, tc.query)
 			} else {
 				response = callManagement(t, app, http.MethodGet, routeAuthFiles, tc.query, nil)
 			}
@@ -210,7 +210,7 @@ func TestAuthFilesStatisticsFollowTimeRangeAndAccountScope(t *testing.T) {
 			// Every request used gpt-5.5, so the breakdown of the same requests repeats the totals.
 			breakdown := url.Values{"auth_index": {view.Files[0].AuthIndex}, "from": tc.query["from"], "to": tc.query["to"]}
 			if tc.key != "" {
-				response = callAccount(t, app, routeUsageModels, tc.key, breakdown)
+				response = callAccountDirect(t, app, routeUsageModels, tc.key, breakdown)
 			} else {
 				response = callManagement(t, app, http.MethodGet, routeUsageModels, breakdown, nil)
 			}
@@ -292,7 +292,7 @@ func TestAccountAuthFilesFollowCredentialRouting(t *testing.T) {
 				}
 			})
 			access := viewAccess{APIKey: true, Scope: scope, Tracked: true}
-			response := callAccount(t, app, routeAuthFiles, accountTestKeyA, nil)
+			response := callAccountDirect(t, app, routeAuthFiles, accountTestKeyA, nil)
 			if response.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", response.StatusCode, response.Body)
 			}
